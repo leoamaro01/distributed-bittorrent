@@ -1,0 +1,7 @@
+- Hash check for pieces
+- Distribute trackers in a Chord
+- Report piece fails to server
+- Report peer offline
+- Login to server when coming online
+- Logout when going offline
+- Resume downloads
