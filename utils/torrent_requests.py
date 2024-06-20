@@ -1,20 +1,25 @@
 import json
 import socket
 from utils.torrent_info import TorrentFileInfo, TorrentInfo, TorrentPeer
-from utils.utils import recv_all
+from utils.utils import TorrentError, recv_all
 import hashlib
 
-# region Request IDs
-RT_INVALID = 0
-RT_ACK = 1
-RT_GET_TORRENT = 2
-RT_FILE_START = 3
-RT_DOWNLOAD_START = 4
-RT_TORRENT = 5
+
+
+# region Response Status
+ST_OK = 20
+ST_NOTFOUND = 44
+
+def status_str(status: int):
+    if status == ST_OK:
+        return "OK"
+    if status == ST_NOTFOUND:
+        return "Not Found"
 # endregion
 
-# --- Standards ---
-# standard piece size: 256KB
+# region Standards
+# standard piece size: 256kB
+PIECE_SIZE = 256 * 1024
 # max file size: ~1PB
 # peers count: max 2^32 (4 bytes)
 PEERS_B = 4
@@ -22,6 +27,7 @@ PEERS_B = 4
 PIECE_COUNT_B = 4
 # file count: max 2^64 (8 bytes)
 FILE_COUNT_B = 8
+# endregion
 
 class TorrentRequest:
     # returns (Request, type of request)
@@ -34,35 +40,51 @@ class TorrentRequest:
         
         request_type = int.from_bytes(recv)
         
-        if request_type == RT_INVALID:
-            raise TypeError("Received invalid request")
-        elif request_type == RT_ACK:
-            return AckRequest(), RT_ACK
-        elif request_type == RT_TORRENT:
-            return TorrentInfoResponse.recv_request(sock)
-        elif request_type == RT_GET_TORRENT:
-            return GetTorrentRequest.recv_request(sock)
-    
+        if request_type not in requests:
+            raise TorrentError(f"Received invalid request {request_type}. Expected one of {requests.keys()}")
+        
+        return requests[request_type](sock)
+        
     def to_bytes(self) -> bytes:
         raise TypeError()
 
-class GetTorrentRequest(TorrentRequest):
+class TorrentExistsRequest(TorrentRequest):
     def __init__(self, torrent_id: str) -> None:
         self.torrent_id = torrent_id
+    
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["TorrentExistsRequest", int]:
+        id_length = int.from_bytes(recv_all(sock, 4))
+        id = recv_all(sock, id_length).decode()
+        
+        return TorrentExistsRequest(id), RT_GET_TORRENT
+    
+    def to_bytes(self) -> bytes:
+        id = self.torrent_id.encode()
+        id_len = len(id).to_bytes(4)
+        
+        return RT_TORRENT_EXISTS.to_bytes() + id_len + id
+
+class GetTorrentRequest(TorrentRequest):
+    def __init__(self, torrent_id: str, include_peers: bool) -> None:
+        self.torrent_id = torrent_id
+        self.include_peers = include_peers
 
     @staticmethod
     def recv_request(sock: socket.socket) -> tuple["GetTorrentRequest", int]:
         id_length = int.from_bytes(recv_all(sock, 4))
         id = recv_all(sock, id_length).decode()
+        include_peers = bool(int.from_bytes(recv_all(sock, 1)))
         
-        return GetTorrentRequest(id), RT_GET_TORRENT
+        return GetTorrentRequest(id, include_peers), RT_GET_TORRENT
 
     def to_bytes(self) -> bytes:
         id = self.torrent_id.encode()
         id_len = len(id).to_bytes(4)
+        include_peers = int(self.include_peers).to_bytes(1)
         
         # Torrent ID Length - Torrent ID
-        return RT_GET_TORRENT.to_bytes() + id_len + id 
+        return RT_GET_TORRENT.to_bytes() + id_len + id + include_peers
 
 class TorrentInfoResponse(TorrentRequest):
     def __init__(self, torrent_info: TorrentInfo) -> None:
@@ -70,6 +92,10 @@ class TorrentInfoResponse(TorrentRequest):
 
     @staticmethod
     def recv_request(sock: socket.socket) -> tuple["TorrentInfoResponse", int]:
+        id_len = int.from_bytes(recv_all(sock, 4))
+        
+        id = recv_all(sock, id_len).decode()
+        
         peers_count = int.from_bytes(recv_all(sock, 4))
         
         peers = []
@@ -110,9 +136,12 @@ class TorrentInfoResponse(TorrentRequest):
                 
                 files.append(TorrentFileInfo(file_name, file_size, hashes))
         
-        return TorrentInfoResponse(TorrentInfo(peers, files, piece_size)), RT_TORRENT
+        return TorrentInfoResponse(TorrentInfo(id, peers, files, piece_size)), RT_TORRENT
 
     def to_bytes(self) -> bytes:
+        id = self.torrent_info.id.encode()
+        id_len = len(id).to_bytes(4)
+        
         peers_count = len(self.torrent_info.peers).to_bytes(PEERS_B)
         peers = b''
         
@@ -145,8 +174,119 @@ class TorrentInfoResponse(TorrentRequest):
         
         piece_size = self.torrent_info.piece_size.to_bytes(4)
         
-        # Peers Count - [Peer IP - Peer Files Count - [File Index - Piece Count - [Piece Index]]] - Piece Size - Files Count - [File Name Size - File Name - File Size - Pieces Count - Piece Hashes]
-        return RT_TORRENT.to_bytes() + peers_count + peers + piece_size + files_count + files
+        # Torrent ID Length - Torrent ID - Peers Count - [Peer IP - Peer Files Count - [File Index - Piece Count - [Piece Index]]] - Piece Size - Files Count - [File Name Size - File Name - File Size - Pieces Count - Piece Hashes]
+        return RT_TORRENT.to_bytes() + id_len + id + peers_count + peers + piece_size + files_count + files
 
-class AckRequest(TorrentRequest):
-    pass
+class DownloadPieceRequest(TorrentRequest):
+    def __init__(self, torrent_id: str, file_index: int, piece_index: int) -> None:
+        self.torrent_id = torrent_id
+        self.file_index = file_index
+        self.piece_index = piece_index
+    
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["DownloadPieceRequest", int]:
+        id_length = int.from_bytes(recv_all(sock, 4))
+        id = recv_all(sock, id_length).decode()
+        
+        file_index = int.from_bytes(recv_all(sock, FILE_COUNT_B))
+        piece_index = int.from_bytes(recv_all(sock, PIECE_COUNT_B))
+        
+        return DownloadPieceRequest(id, file_index, piece_index), RT_DOWNLOAD_PIECE
+    
+    def to_bytes(self) -> bytes:
+        id = self.torrent_id.encode()
+        id_len = len(id).to_bytes(4)
+        
+        # Torrent ID Length - Torrent ID - File Index - Piece Index
+        return RT_DOWNLOAD_PIECE.to_bytes() + id_len + id + self.file_index.to_bytes(FILE_COUNT_B) + self.piece_index.to_bytes(PIECE_COUNT_B)
+
+class UploadTorrentRequest(TorrentRequest):
+    def __init__(self, ip: str, files: list[tuple[str, int, list[bytes]]]):
+        self.ip = ip
+        self.files = files
+    
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["UploadTorrentRequest", int]:
+        ip = '.'.join(str(b) for b in recv_all(sock, 4))
+        
+        files_count = int.from_bytes(recv_all(sock, FILE_COUNT_B))
+        files = []
+        
+        for _ in range(files_count):
+            name_len = int.from_bytes(recv_all(sock, 4))
+            name = recv_all(sock, name_len).decode()
+            size = int.from_bytes(recv_all(sock, 8))
+            pieces_count = int.from_bytes(recv_all(sock, PIECE_COUNT_B))
+            
+            pieces = []
+            for _ in range(pieces_count):
+                pieces.append(recv_all(sock, 32))
+            
+            files.append((name, size, pieces))
+        
+        return UploadTorrentRequest(ip, files), RT_UPLOAD_TORRENT
+    
+    def to_bytes(self) -> bytes:
+        ip = b''.join(int(i).to_bytes() for i in self.ip.split('.'))
+        files_count = len(self.files).to_bytes(FILE_COUNT_B)
+        files = b''
+        
+        for file in self.files:
+            name = file[0].encode()
+            name_len = len(name).to_bytes(4)
+            size = file[1].to_bytes(8)
+            pieces_count = len(file[2]).to_bytes(PIECE_COUNT_B)
+            pieces = b''.join(file[2])
+            
+            files += name_len + name + size + pieces_count + pieces
+        
+        return RT_UPLOAD_TORRENT.to_bytes() + ip + files_count + files
+    
+class UploadTorrentResponse(TorrentRequest):
+    def __init__(self, torrent_id: str):
+        self.torrent_id = torrent_id
+        
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["UploadTorrentResponse", int] | None:
+        id_len = int.from_bytes(recv_all(sock, 4))
+        id = recv_all(sock, id_len).decode()
+        
+        return UploadTorrentResponse(id), RT_UPLOAD_RESPONSE
+    
+    def to_bytes(self) -> bytes:
+        id = self.torrent_id.encode()
+        id_len = len(id).to_bytes(4)
+        
+        return RT_UPLOAD_RESPONSE.to_bytes() + id_len + id
+
+class StatusResponse(TorrentRequest):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+    
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["StatusResponse", int] | None:
+        status = int.from_bytes(recv_all(sock, 1))
+        return StatusResponse(status), RT_STATUS
+    
+    def to_bytes(self) -> bytes:
+        return RT_STATUS.to_bytes() + self.status_code.to_bytes(1)
+
+# region Request IDs
+RT_STATUS = 1
+RT_GET_TORRENT = 2
+RT_TORRENT = 3
+RT_DOWNLOAD_PIECE = 4
+RT_UPLOAD_TORRENT = 5
+RT_UPLOAD_RESPONSE = 6
+RT_TORRENT_EXISTS = 7
+
+requests = {
+    RT_STATUS: StatusResponse.recv_request,
+    RT_GET_TORRENT: GetTorrentRequest.recv_request,
+    RT_TORRENT: TorrentInfoResponse.recv_request,
+    RT_DOWNLOAD_PIECE: DownloadPieceRequest.recv_request,
+    RT_UPLOAD_TORRENT: UploadTorrentRequest.recv_request,
+    RT_UPLOAD_RESPONSE: UploadTorrentResponse.recv_request,
+    RT_TORRENT_EXISTS: TorrentExistsRequest.recv_request
+}        
+# endregion

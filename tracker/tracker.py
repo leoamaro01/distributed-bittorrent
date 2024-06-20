@@ -51,7 +51,7 @@ def handle_client(client: socket.socket):
             peers = matching_torrents[0].peers
             files = matching_torrents[0].files
         
-        client.sendall(TorrentInfoResponse(peers, files).to_bytes())
+        client.sendall(TorrentInfoResponse(req.torrent_id, peers, files).to_bytes())
         
     client.close()    
 
