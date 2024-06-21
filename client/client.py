@@ -3,12 +3,12 @@ import socket
 import os
 import os.path as path
 from threading import Lock, Thread
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Callable
 from utils.torrent_requests import *
 import hashlib
 import texts
-
+from queue import SimpleQueue
 from utils.utils import TorrentError
 
 CLIENT_CONNECTION_PORT = 7010
@@ -17,13 +17,15 @@ DOWNLOAD_THREADS = 10
 
 UPLOAD_THREADS = 10
 
+open_files_locks: dict[str, Lock] = {}
+open_files_locks_lock: Lock = Lock()
+
 downloads_from_hosts: dict[str, int] = {}
 dfh_lock: Lock = Lock()
 
 # Torrent ID : [ Paths ]
 available_seeds: dict[str, str] = []
 seeds_lock: Lock = Lock()
-
 
 def get_torrent_info(torrent_id: str, include_peers: bool = True) -> TorrentInfo:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -45,6 +47,27 @@ def get_torrent_info(torrent_id: str, include_peers: bool = True) -> TorrentInfo
     
     return req.torrent_info
 
+def open_file_with_lock(file_path):
+    open_files_locks_lock.acquire()
+    
+    if file_path in open_files_locks:
+        lock = open_files_locks[file_path]
+        open_files_locks_lock.release()
+        lock.acquire()
+    else:
+        lock = Lock()
+        open_files_locks[file_path] = lock
+        open_files_locks_lock.release()
+        lock.acquire()
+
+def close_file_with_lock(file_path):
+    with open_files_locks_lock:
+        if file_path not in open_files_locks:
+            print("Tried to release file lock that was not acquired.")
+            return
+        
+        open_files_locks[file_path].release()
+
 def upload_torrent(torrent_path: str):
     if not path.exists(torrent_path):
         raise TorrentError(f"Specified path {torrent_path} does not exist")
@@ -64,14 +87,19 @@ def upload_torrent(torrent_path: str):
             file_size = path.getsize(file_path)
             piece_hashes = []
             
-            with open(file_path, 'rb') as f:
-                while True:
-                    piece = f.read(PIECE_SIZE)
-                    
-                    if len(piece) == 0:
-                        break
-                    
-                    piece_hashes.append(calculate_piece_hash(piece))
+            open_file_with_lock(file_path)
+            
+            try:
+                with open(file_path, 'rb') as f:
+                    while True:
+                        piece = f.read(PIECE_SIZE)
+                        
+                        if len(piece) == 0:
+                            break
+                        
+                        piece_hashes.append(calculate_piece_hash(piece))
+            finally:
+                close_file_with_lock(file_path)
             
             files.append((file_name, file_size, piece_hashes))
     
@@ -109,9 +137,9 @@ def download_torrent(torrent_id: str):
     info = get_torrent_info(torrent_id)
     
     if len(info.files) == 0:
-        raise TorrentError(f"Torrent {torrent_id} not found or empty.")
+        print(f"Torrent {torrent_id} not found or empty.")
 
-    downloaded: dict[int, list[int]] = [] # TODO: fill with existing data for resuming
+    downloaded: dict[int, list[int]] = []
     
     partial_torrent_path = f"downloads/.partial/{torrent_id}"
     
@@ -151,10 +179,15 @@ def download_torrent(torrent_id: str):
                 
                 if path.getsize(piece_path) != info.piece_size:
                     os.remove(piece_path)
-                        
-                f = open(piece_path, "rb")
-                piece_contents = f.read()
-                f.close()
+                
+                open_file_with_lock(piece_path)
+                
+                try:
+                    f = open(piece_path, "rb")
+                    piece_contents = f.read()
+                    f.close()
+                finally:
+                    close_file_with_lock(piece_path)
                 
                 if not check_piece_hash(piece_contents, piece_hash):
                     os.remove(piece_path)
@@ -194,14 +227,15 @@ def download_torrent(torrent_id: str):
     rarity_ordered.sort(key=lambda file_piece: len(pieces[file_piece]))
     
     with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as executor:
-        futures = [executor.submit(download_file_piece, info.files[file].file_name, file, piece, pieces[(file, piece)]) 
+        futures = [executor.submit(download_file_piece, info, file, piece, pieces[(file, piece)]) 
                    for file, piece in rarity_ordered]
-        
-        for future in as_completed(futures):
+    
+        for future in as_completed(futures):            
             result = future.result()
-            
             if result == None:
                 return
+            
+            print(f"Downloaded {result}!")
             
             file, piece = result
 
@@ -211,15 +245,27 @@ def download_torrent(torrent_id: str):
                 del pending_download[file] 
                 
                 # reconstruct file
-                file_name = f"downloads/{torrent_id}/{info.files[file].file_name}"
+                file_name = path.join(f"downloads/{torrent_id}", info.files[file].file_name)
                 os.makedirs(path.dirname(file_name), exist_ok=True)
                 
-                with open(file_name, 'wb') as f:
-                    for piece in range(len(info.files[file].piece_hashes)):
-                        file_hex = get_hex(file)
-                        piece_hex = get_hex(piece)
-                        with open(f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}", 'rb') as piece_file:
-                            f.write(piece_file.read())
+                open_file_with_lock(file_name)
+                
+                try:
+                    with open(file_name, 'wb') as f:
+                        for piece in range(len(info.files[file].piece_hashes)):
+                            file_hex = get_hex(file)
+                            piece_hex = get_hex(piece)
+                            piece_path = f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}"
+                            
+                            open_file_with_lock(piece_path)
+                            
+                            try:
+                                with open(piece_path, 'rb') as piece_file:
+                                    f.write(piece_file.read())
+                            finally:
+                                close_file_with_lock(piece_path)
+                finally:
+                    close_file_with_lock(file_name)
                 
                 # remove partial files
                 for piece in range(len(info.files[file].piece_hashes)):
@@ -244,19 +290,24 @@ def check_file(torrent_info: TorrentInfo, file_index: int) -> bool:
     if not path.exists(file_path):
         return False
     
-    with open(file_path, 'rb') as file:
-        if len(file) != file_info.file_size:
-            return False
-
-        pieces = len(file_info.piece_hashes)
-        
-        for i in range(pieces):
-            piece_size = get_piece_size(torrent_info, file_index, i)
-            
-            piece = file.read(piece_size)
-            
-            if not check_piece_hash(piece, file_info.piece_hashes[i]):
+    open_file_with_lock(file_path)
+    
+    try:
+        with open(file_path, 'rb') as file:
+            if len(file) != file_info.file_size:
                 return False
+
+            pieces = len(file_info.piece_hashes)
+            
+            for i in range(pieces):
+                piece_size = get_piece_size(torrent_info, file_index, i)
+                
+                piece = file.read(piece_size)
+                
+                if not check_piece_hash(piece, file_info.piece_hashes[i]):
+                    return False
+    finally:
+        close_file_with_lock(file_path)
             
     return True
     
@@ -271,7 +322,7 @@ def get_piece_size(torrent_info: TorrentInfo, file_index , piece_index: int):
         
     return piece_size
 
-def download_file_piece(torrent_info: TorrentInfo, file_name: str, file_index: int, piece_index: int, peers: list[str]) -> tuple[int, int] | None:
+def download_file_piece(torrent_info: TorrentInfo, file_index: int, piece_index: int, peers: list[str]) -> tuple[int, int] | None:
     peers_copy = peers.copy()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:        
         with dfh_lock:
@@ -307,8 +358,19 @@ def download_file_piece(torrent_info: TorrentInfo, file_name: str, file_index: i
                     
                     file_bytes = recv_all(sock, piece_size)
                     
-                    with open(f"downloads/.partial/{torrent_info.id}/{get_hex(file_index)}/{get_hex(piece_index)}", 'wb') as piece_file:
-                        piece_file.write(file_bytes)
+                    if not check_piece_hash(file_bytes, torrent_info.files[file_index].piece_hashes[piece_index]):
+                        raise TorrentError("Could not verify file received from peer.")
+                    
+                    piece_path = f"downloads/.partial/{torrent_info.id}/{get_hex(file_index)}/{get_hex(piece_index)}"
+                    os.makedirs(path.dirname(piece_path), exist_ok=True)
+
+                    open_file_with_lock(piece_path)
+                    
+                    try:
+                        with open(piece_path, 'wb') as piece_file:
+                            piece_file.write(file_bytes)
+                    finally:
+                        close_file_with_lock(piece_path)
                     
                     return file_index, piece_index
                 except Exception as e:
@@ -413,8 +475,100 @@ def load_seeds():
         
         print("Finished loading Seeds.")        
 
+def handle_incoming_peer(sock: socket.socket):
+    req, req_type = TorrentRequest.recv_request(sock)
+    
+    if req_type == RT_DOWNLOAD_PIECE:
+        req: DownloadPieceRequest
+        
+        with seeds_lock:
+            torrent_in_seeds = req.torrent_id in available_seeds
+            
+        if not torrent_in_seeds:
+            sock.sendall(StatusResponse(ST_NOTFOUND).to_bytes())
+            sock.close()
+            return
+
+        with seeds_lock:
+            paths = available_seeds[req.torrent_id]
+        
+        torrent_info = get_torrent_info(req.torrent_id, False)
+        
+        if len(torrent_info.files) == 0:
+            print("Invalid Torrent")
+            sock.sendall(StatusResponse(ST_NOTFOUND).to_bytes())
+            sock.close()
+            return
+        
+        file = torrent_info.files[req.file_index]
+        piece_hash = file.piece_hashes[req.piece_index]
+        
+        for p in paths:
+            with seeds_lock:
+                is_partial = available_seeds.startswith("downloads/.partial")
+
+            if is_partial:
+                file_hex = get_hex(req.file_index)
+                piece_hex = get_hex(req.piece_index)
+                
+                piece_file_path = f"downloads/.partial/{req.torrent_id}/{file_hex}/{piece_hex}"
+                
+                open_file_with_lock(piece_file_path)
+                try:
+                    with open(piece_file_path, "rb") as f:
+                        piece_bytes = f.read()
+                finally:
+                    close_file_with_lock(piece_file_path)
+                
+                if not check_piece_hash(piece_bytes, piece_hash):
+                    continue
+                
+                try:
+                    sock.sendall(piece_bytes)
+                except:
+                    continue
+                else:
+                    return
+            else:
+                file_path = path.join(p, file.file_name)
+                
+                if not path.exists(file_path) or not path.isfile(file_path):
+                    continue
+                
+                if path.getsize(file_path) != torrent_info.files[req.file_index].file_size:
+                    continue
+                
+                open_file_with_lock(file_path)  
+                
+                try:
+                    with open(file_path, "rb") as f:
+                        f.seek(req.piece_index * torrent_info.piece_size)
+                        piece_bytes = f.read(torrent_info.piece_size)
+                finally:
+                    close_file_with_lock(file_path)
+                
+                if not check_piece_hash(piece_bytes, piece_hash):
+                    continue
+                
+                try:
+                    sock.sendall(piece_bytes)
+                except:
+                    continue
+                else:
+                    return            
+
 def seeder_thread():
-    pass
+    seeder_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    seeder_socket.bind(('', CLIENT_CONNECTION_PORT))
+    seeder_socket.listen()
+    
+    while True:
+        client, _ = seeder_socket.accept()
+        
+        client_thread = Thread(target=handle_incoming_peer, args=[client])
+        client_thread.start()
+    
 
 # region Commands
 def print_help(args: list[str]):
