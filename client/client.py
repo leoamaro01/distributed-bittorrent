@@ -12,6 +12,7 @@ from queue import SimpleQueue
 from utils.utils import TorrentError
 
 CLIENT_CONNECTION_PORT = 7010
+SERVER_COMMS_PORT = 7011
 
 DOWNLOAD_THREADS = 10
 
@@ -32,7 +33,7 @@ def get_torrent_info(torrent_id: str, include_peers: bool = True) -> TorrentInfo
 
     # TODO: server distribution in chord
     # How do I find the address of a running node in the chord?
-    sock.connect(("bittorrent-tracker", 8080))
+    connect_socket_to_server(sock)
 
     sock.sendall(GetTorrentRequest(torrent_id, include_peers).to_bytes())
     
@@ -108,16 +109,10 @@ def upload_torrent(torrent_path: str):
     sock = None
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        try:
-            sock.connect(("bittorrent-tracker", 8080))
-        except:
-            raise TorrentError("Failed to connect to tracker. Check your network connection.")    
-        
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
+        connect_socket_to_server(sock)
         
         try:
-            sock.sendall(UploadTorrentRequest(ip, files).to_bytes())
+            sock.sendall(UploadTorrentRequest(files).to_bytes())
         except:
             raise TorrentError("Failed to upload torrent info. Check your network connection.")
         
@@ -282,10 +277,11 @@ def calculate_piece_hash(piece: bytes) -> bytes:
 def check_piece_hash(piece: bytes, hash: bytes) -> bool:
     return calculate_piece_hash(piece) == hash
 
-def check_file(torrent_info: TorrentInfo, file_index: int) -> bool:
+def check_file(torrent_info: TorrentInfo, file_index: int, file_path:str = None) -> bool:
     file_info: TorrentFileInfo = torrent_info.files[file_index]
     
-    file_path = path.join(f"downloads/{torrent_info.id}", file_info.file_name)
+    if file_path == None:
+        file_path = path.join(f"downloads/{torrent_info.id}", file_info.file_name)
     
     if not path.exists(file_path):
         return False
@@ -379,6 +375,8 @@ def download_file_piece(torrent_info: TorrentInfo, file_index: int, piece_index:
         return None       
 
 def load_seeds():
+    available_seeds = {}
+    
     print("Loading Seeds...")
     
     os.makedirs("downloads/.partial", exist_ok=True)
@@ -396,7 +394,8 @@ def load_seeds():
         
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as torrent_exists_request:  
             try:
-                torrent_exists_request.connect(("bittorrent-tracker", 8080))
+                connect_socket_to_server(torrent_exists_request)
+                
                 torrent_exists_request.sendall(TorrentExistsRequest(item).to_bytes())
                 
                 req, req_type = TorrentRequest.recv_request(torrent_exists_request)
@@ -447,7 +446,7 @@ def load_seeds():
         
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as torrent_exists_request:  
             try:
-                torrent_exists_request.connect(("bittorrent-tracker", 8080))
+                connect_socket_to_server(torrent_exists_request)
                 torrent_exists_request.sendall(TorrentExistsRequest(item).to_bytes())
                 
                 req, req_type = TorrentRequest.recv_request(torrent_exists_request)
@@ -569,6 +568,83 @@ def seeder_thread():
         client_thread = Thread(target=handle_incoming_peer, args=[client])
         client_thread.start()
     
+def handle_server_request(sock: socket.socket):
+    req, req_type = TorrentRequest.recv_request(sock)
+    
+    if req_type == RT_AVAILABLE_PIECES:
+        req: GetAvailablePiecesRequest
+        
+        if req.torrent_id not in available_seeds:
+            sock.sendall(AvailablePiecesResponse({}).to_bytes())
+            sock.close()
+            return
+        
+        with seeds_lock:
+            paths: list[str] = available_seeds[req.torrent_id].copy()
+            
+        file_pieces = {}
+        
+        torrent_info = get_torrent_info(req.torrent_id, False)
+        
+        for torrent_path in paths:
+            if torrent_path.startswith("downloads/.partial"):
+                for file in os.listdir(torrent_path):
+                    try:
+                        file_index = int(file, base=16)
+                    except:
+                        continue
+                    
+                    file_pieces[file_index] = []
+                    
+                    for piece in os.listdir(torrent_path):
+                        try:
+                            piece_index = int(piece, base=16)
+                        except:
+                            continue
+                        
+                        piece_path = path.join(torrent_path, file, piece)
+                        open_file_with_lock(piece_path)
+                        
+                        with open(piece_path, "rb") as f:
+                            piece_bytes = f.read()                        
+                        close_file_with_lock(piece_path)
+                        
+                        if not check_piece_hash(piece_bytes, torrent_info.files[file_index].piece_hashes[piece_index]):
+                            continue
+                        
+                        file_pieces[file_index].append(piece_index)
+            else:
+                for e, file in enumerate(torrent_info.files):
+                    file_path = path.join(torrent_path, file.file_name)
+                    
+                    if check_file(torrent_info, e, file_path):
+                        file_pieces[file] = [i for i in range(len(file.piece_hashes))]
+        
+        sock.sendall(AvailablePiecesResponse(file_pieces).to_bytes())
+        sock.close()
+        return
+    
+    if req_type == RT_GET_CLIENT_TORRENTS:
+        req: GetClientTorrentsRequest
+        
+        with seeds_lock:
+            torrents = list(available_seeds.keys())
+        
+        sock.sendall(ClientTorrentsResponse(torrents).to_bytes())
+        sock.close()
+        return
+     
+def server_communication_thread():
+    comms_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    comms_socket.bind(('', SERVER_COMMS_PORT))
+    comms_socket.listen()
+    
+    while True:
+        server_sock, _ = server_sock.accept()
+        
+        server_thread = Thread(target=handle_server_request, args=[server_sock])
+        server_thread.start()
 
 # region Commands
 def print_help(args: list[str]):
@@ -606,10 +682,23 @@ def upload_command(args: list[str]):
     except TorrentError as e:
         print(f"Failed to upload torrent. Error:\n{e.message}")
 
+def exit_command(args: list[str]):
+    print("Logging out of server...")
+    
+    logout_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    connect_socket_to_server(logout_socket)
+    
+    logout_socket.sendall(LogoutRequest().to_bytes())
+    
+    print("Exiting...")
+    exit(0)
+
 commands: dict[str, Callable] = {
         "help": print_help,
         "download": download_command,
-        "upload": upload_command
+        "upload": upload_command,
+        "exit": exit_command
     }
 
 # endregion
@@ -651,7 +740,13 @@ def split_command(command: str) -> list[str]:
         result.append(command[current_start:])
     
     return result
-            
+
+def connect_socket_to_server(socket: socket.socket):
+    try:
+        socket.connect(("bittorrent-tracker", 8080))
+    except:
+        raise TorrentError("Failed to connect to tracker. Check your network connection.")
+          
 def main():
     print("Welcome to CDL-BitTorrent!")
     print("Starting Up...")
@@ -662,6 +757,20 @@ def main():
     
     seeder = Thread(target=seeder_thread, name="seeder")
     seeder.start()
+    
+    print("Starting server communication thread...")
+    
+    server_comms = Thread(target=server_communication_thread, name="server_comms")
+    server_comms.start()
+    
+    print("Logging in to server...")    
+    
+    login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    connect_socket_to_server(login_socket)
+    
+    login_socket.sendall(LoginRequest().to_bytes())
+    login_socket.close()
     
     print("Done!")
     

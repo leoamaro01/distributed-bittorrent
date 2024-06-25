@@ -201,14 +201,11 @@ class DownloadPieceRequest(TorrentRequest):
         return RT_DOWNLOAD_PIECE.to_bytes() + id_len + id + self.file_index.to_bytes(FILE_COUNT_B) + self.piece_index.to_bytes(PIECE_COUNT_B)
 
 class UploadTorrentRequest(TorrentRequest):
-    def __init__(self, ip: str, files: list[tuple[str, int, list[bytes]]]):
-        self.ip = ip
+    def __init__(self, files: list[tuple[str, int, list[bytes]]]):
         self.files = files
     
     @staticmethod
     def recv_request(sock: socket.socket) -> tuple["UploadTorrentRequest", int]:
-        ip = '.'.join(str(b) for b in recv_all(sock, 4))
-        
         files_count = int.from_bytes(recv_all(sock, FILE_COUNT_B))
         files = []
         
@@ -224,10 +221,9 @@ class UploadTorrentRequest(TorrentRequest):
             
             files.append((name, size, pieces))
         
-        return UploadTorrentRequest(ip, files), RT_UPLOAD_TORRENT
+        return UploadTorrentRequest(files), RT_UPLOAD_TORRENT
     
     def to_bytes(self) -> bytes:
-        ip = b''.join(int(i).to_bytes() for i in self.ip.split('.'))
         files_count = len(self.files).to_bytes(FILE_COUNT_B)
         files = b''
         
@@ -240,7 +236,7 @@ class UploadTorrentRequest(TorrentRequest):
             
             files += name_len + name + size + pieces_count + pieces
         
-        return RT_UPLOAD_TORRENT.to_bytes() + ip + files_count + files
+        return RT_UPLOAD_TORRENT.to_bytes() + files_count + files
     
 class UploadTorrentResponse(TorrentRequest):
     def __init__(self, torrent_id: str):
@@ -271,6 +267,102 @@ class StatusResponse(TorrentRequest):
     def to_bytes(self) -> bytes:
         return RT_STATUS.to_bytes() + self.status_code.to_bytes(1)
 
+class GetAvailablePiecesRequest(TorrentRequest):
+    def __init__(self, torrent_id: str) -> None:
+        self.torrent_id = torrent_id
+    
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["GetAvailablePiecesRequest", int]:
+        id_length = int.from_bytes(recv_all(sock, 4))
+        id = recv_all(sock, id_length).decode()
+        
+        return GetAvailablePiecesRequest(id), RT_AVAILABLE_PIECES
+    
+    def to_bytes(self) -> bytes:
+        id = self.torrent_id.encode()
+        id_len = len(id).to_bytes(4)
+        
+        return RT_AVAILABLE_PIECES.to_bytes() + id_len + id
+
+class AvailablePiecesResponse(TorrentRequest):
+    def __init__(self, file_pieces: dict[int, list[int]]) -> None:
+        self.file_pieces = file_pieces
+        
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["AvailablePiecesResponse", int]:
+        file_count = int.from_bytes(recv_all(sock, FILE_COUNT_B))
+        
+        file_pieces = {}
+        
+        for _ in range(file_count):
+            file_index = int.from_bytes(recv_all(sock, FILE_COUNT_B))
+            pieces_count = int.from_bytes(recv_all(sock, PIECE_COUNT_B))
+        
+            pieces = []
+            for _ in range(pieces_count):
+                pieces.append(int.from_bytes(recv_all(sock, PIECE_COUNT_B)))
+            
+            file_pieces[file_index] = pieces
+        
+        return AvailablePiecesResponse(file_pieces), RT_PIECES_RESPONSE
+    
+    def to_bytes(self) -> bytes:
+        file_count = len(self.file_pieces).to_bytes(FILE_COUNT_B)
+        pieces = b''
+        
+        for file in self.file_pieces:
+            pieces_count = len(self.file_pieces[file]).to_bytes(PIECE_COUNT_B)
+            pieces += file.to_bytes(FILE_COUNT_B) + pieces_count + b''.join(piece.to_bytes(PIECE_COUNT_B) for piece in self.file_pieces[file])
+        
+        return RT_PIECES_RESPONSE.to_bytes() + file_count + pieces
+
+class LoginRequest(TorrentRequest):
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple[TorrentRequest, int] | None:
+        return LoginRequest(), RT_LOGIN
+    
+    def to_bytes(self) -> bytes:
+        return RT_LOGIN.to_bytes()
+
+class LogoutRequest(TorrentRequest):
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple[TorrentRequest, int] | None:
+        return LogoutRequest(), RT_LOGOUT
+    
+    def to_bytes(self) -> bytes:
+        return RT_LOGOUT.to_bytes()
+    
+class GetClientTorrentsRequest(TorrentRequest):
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple[TorrentRequest, int] | None:
+        return GetClientTorrentsRequest(), RT_GET_CLIENT_TORRENTS
+    
+    def to_bytes(self) -> bytes:
+        return RT_GET_CLIENT_TORRENTS.to_bytes()
+
+class ClientTorrentsResponse(TorrentRequest):
+    def __init__(self, torrents: list[str]) -> None:
+        self.torrents = torrents
+        
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["ClientTorrentsResponse", int]:
+        torrents_count = int.from_bytes(recv_all(sock, 4))
+        torrents = []
+        
+        for _ in range(torrents_count):
+            id_len = int.from_bytes(recv_all(sock, 4))
+            id = recv_all(sock, id_len).decode()
+            
+            torrents.append(id)
+        
+        return ClientTorrentsResponse(torrents), RT_CLIENT_TORRENTS_RESPONSE
+    
+    def to_bytes(self) -> bytes:
+        torrents_count = len(self.torrents).to_bytes(4)
+        torrents = b''.join(len(t).to_bytes(4) + t.encode() for t in self.torrents)
+        
+        return RT_CLIENT_TORRENTS_RESPONSE.to_bytes() + torrents_count + torrents
+
 # region Request IDs
 RT_STATUS = 1
 RT_GET_TORRENT = 2
@@ -279,6 +371,12 @@ RT_DOWNLOAD_PIECE = 4
 RT_UPLOAD_TORRENT = 5
 RT_UPLOAD_RESPONSE = 6
 RT_TORRENT_EXISTS = 7
+RT_AVAILABLE_PIECES = 8
+RT_PIECES_RESPONSE = 9
+RT_LOGIN = 10
+RT_LOGOUT = 11
+RT_GET_CLIENT_TORRENTS = 12
+RT_CLIENT_TORRENTS_RESPONSE = 13
 
 requests = {
     RT_STATUS: StatusResponse.recv_request,
@@ -287,6 +385,12 @@ requests = {
     RT_DOWNLOAD_PIECE: DownloadPieceRequest.recv_request,
     RT_UPLOAD_TORRENT: UploadTorrentRequest.recv_request,
     RT_UPLOAD_RESPONSE: UploadTorrentResponse.recv_request,
-    RT_TORRENT_EXISTS: TorrentExistsRequest.recv_request
+    RT_TORRENT_EXISTS: TorrentExistsRequest.recv_request,
+    RT_AVAILABLE_PIECES: GetAvailablePiecesRequest.recv_request,
+    RT_PIECES_RESPONSE: AvailablePiecesResponse.recv_request,
+    RT_LOGIN: LoginRequest.recv_request,
+    RT_LOGOUT: LogoutRequest.recv_request,
+    RT_GET_CLIENT_TORRENTS: GetClientTorrentsRequest.recv_request,
+    RT_CLIENT_TORRENTS_RESPONSE: ClientTorrentsResponse.recv_request
 }        
 # endregion
