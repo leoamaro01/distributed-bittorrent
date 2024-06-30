@@ -1,8 +1,6 @@
-import json
 import socket
 from utils.torrent_info import TorrentFileInfo, TorrentInfo, TorrentPeer
 from utils.utils import TorrentError, recv_all
-import hashlib
 
 
 
@@ -201,13 +199,14 @@ class DownloadPieceRequest(TorrentRequest):
         return RT_DOWNLOAD_PIECE.to_bytes() + id_len + id + self.file_index.to_bytes(FILE_COUNT_B) + self.piece_index.to_bytes(PIECE_COUNT_B)
 
 class UploadTorrentRequest(TorrentRequest):
-    def __init__(self, files: list[tuple[str, int, list[bytes]]]):
+    def __init__(self, files: list[TorrentFileInfo], piece_size: int):
         self.files = files
+        self.piece_size = piece_size
     
     @staticmethod
     def recv_request(sock: socket.socket) -> tuple["UploadTorrentRequest", int]:
         files_count = int.from_bytes(recv_all(sock, FILE_COUNT_B))
-        files = []
+        files: list[TorrentFileInfo] = []
         
         for _ in range(files_count):
             name_len = int.from_bytes(recv_all(sock, 4))
@@ -219,24 +218,28 @@ class UploadTorrentRequest(TorrentRequest):
             for _ in range(pieces_count):
                 pieces.append(recv_all(sock, 32))
             
-            files.append((name, size, pieces))
+            files.append(TorrentFileInfo(name, size, pieces))
         
-        return UploadTorrentRequest(files), RT_UPLOAD_TORRENT
+        piece_size = int.from_bytes(recv_all(sock, 4))
+        
+        return UploadTorrentRequest(files, piece_size), RT_UPLOAD_TORRENT
     
     def to_bytes(self) -> bytes:
         files_count = len(self.files).to_bytes(FILE_COUNT_B)
         files = b''
         
         for file in self.files:
-            name = file[0].encode()
+            name = file.file_name.encode()
             name_len = len(name).to_bytes(4)
-            size = file[1].to_bytes(8)
-            pieces_count = len(file[2]).to_bytes(PIECE_COUNT_B)
-            pieces = b''.join(file[2])
+            size = file.file_size.to_bytes(8)
+            pieces_count = len(file.piece_hashes).to_bytes(PIECE_COUNT_B)
+            pieces = b''.join(file.piece_hashes)
             
             files += name_len + name + size + pieces_count + pieces
         
-        return RT_UPLOAD_TORRENT.to_bytes() + files_count + files
+        piece_size = self.piece_size.to_bytes(4)
+        
+        return RT_UPLOAD_TORRENT.to_bytes() + files_count + files + piece_size
     
 class UploadTorrentResponse(TorrentRequest):
     def __init__(self, torrent_id: str):

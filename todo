@@ -1,2 +1,4 @@
 - Distribute trackers in a Chord
-- Report peer offline
+- Check on peer every 5 minutes
+- Create a server command lineZ
+- Erasing torrents

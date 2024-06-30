@@ -1,4 +1,4 @@
-from io import BufferedReader
+import json
 import socket
 import os
 import os.path as path
@@ -37,6 +37,8 @@ def get_torrent_info(torrent_id: str, include_peers: bool = True) -> TorrentInfo
 
     sock.sendall(GetTorrentRequest(torrent_id, include_peers).to_bytes())
     
+    sock.settimeout(None)
+    
     req, req_type = TorrentRequest.recv_request(sock)
     
     sock.close()
@@ -74,7 +76,7 @@ def upload_torrent(torrent_path: str):
         raise TorrentError(f"Specified path {torrent_path} does not exist")
     
     # [(file_name, file_size, [piece_hashes])]
-    files: list[tuple[str, int, list[bytes]]] = []
+    files: list[TorrentFileInfo] = []
     
     print("Uploading torrent...")
     print("Generating piece hashes...")
@@ -102,7 +104,7 @@ def upload_torrent(torrent_path: str):
             finally:
                 close_file_with_lock(file_path)
             
-            files.append((file_name, file_size, piece_hashes))
+            files.append(TorrentFileInfo(file_name, file_size, piece_hashes))
     
     print("Uploading torrent info...")
     
@@ -112,7 +114,7 @@ def upload_torrent(torrent_path: str):
         connect_socket_to_server(sock)
         
         try:
-            sock.sendall(UploadTorrentRequest(files).to_bytes())
+            sock.sendall(UploadTorrentRequest(files, PIECE_SIZE).to_bytes())
         except:
             raise TorrentError("Failed to upload torrent info. Check your network connection.")
         
@@ -228,7 +230,7 @@ def download_torrent(torrent_id: str):
         for future in as_completed(futures):            
             result = future.result()
             if result == None:
-                return
+                continue
             
             print(f"Downloaded {result}!")
             
@@ -237,7 +239,7 @@ def download_torrent(torrent_id: str):
             pending_download[file].remove(piece)
             
             if len(pending_download[file]) == 0:
-                del pending_download[file] 
+                pending_download.pop(file) 
                 
                 # reconstruct file
                 file_name = path.join(f"downloads/{torrent_id}", info.files[file].file_name)
@@ -267,56 +269,6 @@ def download_torrent(torrent_id: str):
                     file_hex = get_hex(file)
                     piece_hex = get_hex(piece)
                     os.remove(f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}")            
-
-def get_hex(n: int) -> str:
-    return hex(n)[2:]
-
-def calculate_piece_hash(piece: bytes) -> bytes:
-    return hashlib.sha256(piece).digest()
-
-def check_piece_hash(piece: bytes, hash: bytes) -> bool:
-    return calculate_piece_hash(piece) == hash
-
-def check_file(torrent_info: TorrentInfo, file_index: int, file_path:str = None) -> bool:
-    file_info: TorrentFileInfo = torrent_info.files[file_index]
-    
-    if file_path == None:
-        file_path = path.join(f"downloads/{torrent_info.id}", file_info.file_name)
-    
-    if not path.exists(file_path):
-        return False
-    
-    open_file_with_lock(file_path)
-    
-    try:
-        with open(file_path, 'rb') as file:
-            if len(file) != file_info.file_size:
-                return False
-
-            pieces = len(file_info.piece_hashes)
-            
-            for i in range(pieces):
-                piece_size = get_piece_size(torrent_info, file_index, i)
-                
-                piece = file.read(piece_size)
-                
-                if not check_piece_hash(piece, file_info.piece_hashes[i]):
-                    return False
-    finally:
-        close_file_with_lock(file_path)
-            
-    return True
-    
-def get_piece_size(torrent_info: TorrentInfo, file_index , piece_index: int):
-    file_info: TorrentFileInfo = torrent_info.files[file_index]
-    piece_size = torrent_info.piece_size
-                    
-    piece_count = len(file_info.piece_hashes)
-    
-    if piece_index == piece_count - 1:
-        piece_size = file_info.file_size - (piece_count - 1) * piece_size
-        
-    return piece_size
 
 def download_file_piece(torrent_info: TorrentInfo, file_index: int, piece_index: int, peers: list[str]) -> tuple[int, int] | None:
     peers_copy = peers.copy()
@@ -372,7 +324,57 @@ def download_file_piece(torrent_info: TorrentInfo, file_index: int, piece_index:
                 except Exception as e:
                     print(f"Failed to download piece from peer {peer}. Error:")
                     print(e)        
-        return None       
+        return None      
+    
+def get_hex(n: int) -> str:
+    return hex(n)[2:]
+
+def calculate_piece_hash(piece: bytes) -> bytes:
+    return hashlib.sha256(piece).digest()
+
+def check_piece_hash(piece: bytes, hash: bytes) -> bool:
+    return calculate_piece_hash(piece) == hash
+
+def check_file(torrent_info: TorrentInfo, file_index: int, file_path:str = None) -> bool:
+    file_info: TorrentFileInfo = torrent_info.files[file_index]
+    
+    if file_path == None:
+        file_path = path.join(f"downloads/{torrent_info.id}", file_info.file_name)
+    
+    if not path.exists(file_path):
+        return False
+    
+    open_file_with_lock(file_path)
+    
+    try:
+        with open(file_path, 'rb') as file:
+            if len(file) != file_info.file_size:
+                return False
+
+            pieces = len(file_info.piece_hashes)
+            
+            for i in range(pieces):
+                piece_size = get_piece_size(torrent_info, file_index, i)
+                
+                piece = file.read(piece_size)
+                
+                if not check_piece_hash(piece, file_info.piece_hashes[i]):
+                    return False
+    finally:
+        close_file_with_lock(file_path)
+            
+    return True
+    
+def get_piece_size(torrent_info: TorrentInfo, file_index , piece_index: int):
+    file_info: TorrentFileInfo = torrent_info.files[file_index]
+    piece_size = torrent_info.piece_size
+                    
+    piece_count = len(file_info.piece_hashes)
+    
+    if piece_index == piece_count - 1:
+        piece_size = file_info.file_size - (piece_count - 1) * piece_size
+        
+    return piece_size 
 
 def load_seeds():
     available_seeds = {}
@@ -683,6 +685,10 @@ def upload_command(args: list[str]):
         print(f"Failed to upload torrent. Error:\n{e.message}")
 
 def exit_command(args: list[str]):
+    if len(args) > 0 and args[0] == "help":
+        print("Exits the client.")
+        return
+    
     print("Logging out of server...")
     
     logout_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -709,7 +715,7 @@ def split_command(command: str) -> list[str]:
     
     scope_char = None
     
-    for i in len(command):
+    for i in range(len(command)):
         if scope_char != None:
             if command[i] == scope_char:
                 scope_char = None
@@ -754,6 +760,8 @@ def main():
     load_seeds()
     
     print("Starting seeder...")
+    
+    socket.setdefaulttimeout(5)
     
     seeder = Thread(target=seeder_thread, name="seeder")
     seeder.start()
