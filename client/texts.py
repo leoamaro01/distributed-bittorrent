@@ -1,8 +1,9 @@
-help_text = """Commands in the CDL-BitTorrent CLI:
+help_text = """Commands in the CDL-BitTorrent Client CLI:
 
     help         Displays this page.
     download     Attempts to download a torrent with a given ID.
     upload       Registers this client as a seeder for a folder in your file system so other clients can download it.
+    exit         Closes the client.
 """
 
 download_help = """Attempts to download a torrent with a given ID.

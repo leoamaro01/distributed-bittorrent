@@ -1,3 +1,4 @@
 - Distribute trackers in a Chord
 - Create a server command line
 - Erasing torrents
+- Stop threads more gracefully when exiting the program

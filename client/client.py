@@ -8,7 +8,7 @@ from typing import Callable
 from utils.torrent_requests import *
 import hashlib
 import texts
-from utils.utils import TorrentError
+from utils.utils import *
 import time
 
 CLIENT_CONNECTION_PORT = 7010
@@ -328,9 +328,6 @@ def download_file_piece(torrent_info: TorrentInfo, file_index: int, piece_index:
                     print(f"Failed to download piece from peer {peer}. Error:")
                     print(e)        
         return None      
-    
-def get_hex(n: int) -> str:
-    return hex(n)[2:]
 
 def calculate_piece_hash(piece: bytes) -> bytes:
     return hashlib.sha256(piece).digest()
@@ -560,18 +557,6 @@ def handle_incoming_peer(sock: socket.socket):
                     continue
                 else:
                     return            
-
-def seeder_thread():
-    seeder_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    seeder_socket.bind(('', CLIENT_CONNECTION_PORT))
-    seeder_socket.listen()
-    
-    while True:
-        client, _ = seeder_socket.accept()
-        
-        client_thread = Thread(target=handle_incoming_peer, args=[client])
-        client_thread.start()
     
 def handle_server_request(sock: socket.socket):
     req, req_type = TorrentRequest.recv_request(sock)
@@ -638,7 +623,25 @@ def handle_server_request(sock: socket.socket):
         sock.sendall(ClientTorrentsResponse(torrents).to_bytes())
     
     sock.close()
-     
+
+def connect_socket_to_server(socket: socket.socket):
+    try:
+        socket.connect(("bittorrent-tracker", 8080))
+    except:
+        raise TorrentError("Failed to connect to tracker. Check your network connection.")
+
+def seeder_thread():
+    seeder_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    seeder_socket.bind(('', CLIENT_CONNECTION_PORT))
+    seeder_socket.listen()
+    
+    while True:
+        client, _ = seeder_socket.accept()
+        
+        client_thread = Thread(target=handle_incoming_peer, args=[client])
+        client_thread.start()
+
 def server_communication_thread():
     comms_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     
@@ -650,6 +653,67 @@ def server_communication_thread():
         
         server_thread = Thread(target=handle_server_request, args=[server_sock])
         server_thread.start()
+
+def attempt_reconnection_thread():
+    while True:
+        time.sleep(1)
+        
+        with last_checkup_lock:
+            if last_checkup == None:
+                continue
+        
+        if time.time() - last_checkup < 11 * 60:
+            continue
+        
+        with last_checkup_lock:
+            last_checkup = None
+        
+        print("Lost connection to server, attempting to reconnect...")
+        
+        login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        connect_socket_to_server(login_socket)
+        
+        login_socket.sendall(LoginRequest().to_bytes())
+        login_socket.close()
+        
+        print("Reconnected to server.")
+        
+def main():
+    print("Welcome to CDL-BitTorrent Client!")
+    print("Starting Up...")
+    
+    load_seeds()
+    
+    socket.setdefaulttimeout(5)
+    
+    seeder = Thread(target=seeder_thread, name="seeder")
+    seeder.start()
+    
+    server_comms = Thread(target=server_communication_thread, name="server_comms")
+    server_comms.start()
+    
+    print("Logging in to server...")    
+    
+    login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    connect_socket_to_server(login_socket)
+    
+    login_socket.sendall(LoginRequest().to_bytes())
+    login_socket.close()
+    
+    print("Done!")
+    
+    while True:
+        print("This is the CDL-BitTorrent Client CLI, use help to learn the available commands.")
+        inp: str = input("$> ").strip()
+        
+        if len(inp) == 0:
+            continue
+        
+        [command, *args] = split_command(inp)
+        
+        commands[command](args)
 
 # region Commands
 
@@ -705,120 +769,10 @@ def exit_command(args: list[str]):
     exit(0)
 
 commands: dict[str, Callable] = {
-        "help": print_help,
-        "download": download_command,
-        "upload": upload_command,
-        "exit": exit_command
-    }
+    "help": print_help,
+    "download": download_command,
+    "upload": upload_command,
+    "exit": exit_command
+}
 
 # endregion
-
-def split_command(command: str) -> list[str]:
-    result: list[str] = []
-    current_start = 0
-    
-    scope_char = None
-    
-    for i in range(len(command)):
-        if scope_char != None:
-            if command[i] == scope_char:
-                scope_char = None
-
-                if i == current_start:
-                    current_start += 1
-                    continue
-                
-                result.append(command[current_start:i])
-                current_start = i + 1
-            continue
-            
-        if command[i].isspace():
-            if i == current_start:
-                current_start += 1
-                continue
-            
-            result.apend(command[current_start:i])
-            current_start = i + 1
-            continue
-        
-        if command[i] in ["'", '"']:
-            scope_char = command[i]
-            current_start = i + 1
-            continue
-    
-    if current_start != len(command):
-        result.append(command[current_start:])
-    
-    return result
-
-def connect_socket_to_server(socket: socket.socket):
-    try:
-        socket.connect(("bittorrent-tracker", 8080))
-    except:
-        raise TorrentError("Failed to connect to tracker. Check your network connection.")
-
-def attempt_reconnection_thread():
-    while True:
-        time.sleep(1)
-        
-        with last_checkup_lock:
-            if last_checkup == None:
-                continue
-        
-        if time.time() - last_checkup < 11 * 60:
-            continue
-        
-        with last_checkup_lock:
-            last_checkup = None
-        
-        print("Lost connection to server, attempting to reconnect...")
-        
-        login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
-        connect_socket_to_server(login_socket)
-        
-        login_socket.sendall(LoginRequest().to_bytes())
-        login_socket.close()
-        
-        print("Reconnected to server.")
-        
-
-def main():
-    print("Welcome to CDL-BitTorrent!")
-    print("Starting Up...")
-    
-    load_seeds()
-    
-    print("Starting seeder...")
-    
-    socket.setdefaulttimeout(5)
-    
-    seeder = Thread(target=seeder_thread, name="seeder")
-    seeder.start()
-    
-    print("Starting server communication thread...")
-    
-    server_comms = Thread(target=server_communication_thread, name="server_comms")
-    server_comms.start()
-    
-    print("Logging in to server...")    
-    
-    login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    
-    connect_socket_to_server(login_socket)
-    
-    login_socket.sendall(LoginRequest().to_bytes())
-    login_socket.close()
-    
-    print("Done!")
-    
-    while True:
-        print("This is the CDL-BitTorrent CLI, use help to learn the available commands.")
-        inp: str = input("$> ").strip()
-        
-        if len(inp) == 0:
-            continue
-        
-        [command, *args] = split_command(inp)
-        
-        commands[command](args)

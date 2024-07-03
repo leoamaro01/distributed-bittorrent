@@ -1,8 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import socket
 from threading import Lock, Thread
+from typing import Callable
 from utils.torrent_requests import *
+from utils.utils import *
 import hashlib
+import texts
 import time
 
 CLIENT_COMMS_PORT = 7011
@@ -178,12 +181,7 @@ def check_client(ip: str) -> tuple[bool, str]:
     finally:
         sock.close()    
 
-def main():
-    socket.setdefaulttimeout(5)
-    
-    check_thread = Thread(target=client_check_thread)
-    check_thread.start()
-    
+def server_requests_tread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     sock.bind(('', 8080))
@@ -194,4 +192,75 @@ def main():
         
         client_thread = Thread(target=handle_client, args=[client, addr[0]])
         client_thread.start()
+
+def main():
+    print("Welcome to CDL-BitTorrent Server!")
+    print("Starting up...")
     
+    socket.setdefaulttimeout(5)
+    
+    check_thread = Thread(target=client_check_thread)
+    check_thread.start()
+    
+    requests_thread = Thread(target=server_requests_tread)
+    requests_thread.start()
+    
+    print("Done!")
+    
+    while True:
+        print("This is the CDL-BitTorrent Server CLI, use help to learn the available commands.")
+        inp: str = input("$> ").strip()
+        
+        if len(inp) == 0:
+            continue
+        
+        [command, *args] = split_command(inp)
+        
+        commands[command](args)
+    
+# region Commands
+
+def print_help(args: list[str]):
+    if len(args) != 0 and args[0] != "help" and args[0] in commands:
+        commands[args[0]](["help"])
+        return
+    
+    print(texts.help_text)
+
+def delete_torrent(args: list[str]):
+    if len(args) == 0:
+        print("Wrong number of arguments in 'delete' command, use 'delete help' for usage info.")
+        return
+    
+    if args[0] == "help":
+        print(texts.delete_help)
+        return
+    
+    with torrents_lock:
+        if args[0] not in torrents:
+            print("Torrent not found.")
+            return        
+        torrents.pop(args[0])
+    
+    with user_torrents_lock:
+        for user in user_torrents:
+            if args[0] in user_torrents[user]:
+                user_torrents[user].remove(args[0])
+    
+    print("Torrent deleted.")
+
+def exit_command(args: list[str]):
+    if len(args) > 0 and args[0] == "help":
+        print("Exits the server.")
+        return
+    
+    print("Exiting...")
+    exit(0)
+
+commands: dict[str, Callable] = {
+    "help": print_help,
+    'delete': delete_torrent,
+    "exit": exit_command
+}
+
+# endregion
