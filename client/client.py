@@ -8,8 +8,8 @@ from typing import Callable
 from utils.torrent_requests import *
 import hashlib
 import texts
-from queue import SimpleQueue
 from utils.utils import TorrentError
+import time
 
 CLIENT_CONNECTION_PORT = 7010
 SERVER_COMMS_PORT = 7011
@@ -27,6 +27,9 @@ dfh_lock: Lock = Lock()
 # Torrent ID : [ Paths ]
 available_seeds: dict[str, str] = []
 seeds_lock: Lock = Lock()
+
+last_checkup = None
+last_checkup_lock: Lock = Lock()
 
 def get_torrent_info(torrent_id: str, include_peers: bool = True) -> TorrentInfo:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -623,18 +626,18 @@ def handle_server_request(sock: socket.socket):
                         file_pieces[file] = [i for i in range(len(file.piece_hashes))]
         
         sock.sendall(AvailablePiecesResponse(file_pieces).to_bytes())
-        sock.close()
-        return
-    
-    if req_type == RT_GET_CLIENT_TORRENTS:
+    elif req_type == RT_GET_CLIENT_TORRENTS:
         req: GetClientTorrentsRequest
+        
+        with last_checkup_lock:
+            last_checkup = time.time()
         
         with seeds_lock:
             torrents = list(available_seeds.keys())
         
         sock.sendall(ClientTorrentsResponse(torrents).to_bytes())
-        sock.close()
-        return
+    
+    sock.close()
      
 def server_communication_thread():
     comms_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -649,6 +652,7 @@ def server_communication_thread():
         server_thread.start()
 
 # region Commands
+
 def print_help(args: list[str]):
     if len(args) != 0 and args[0] != "help" and args[0] in commands:
         commands[args[0]](["help"])
@@ -752,7 +756,33 @@ def connect_socket_to_server(socket: socket.socket):
         socket.connect(("bittorrent-tracker", 8080))
     except:
         raise TorrentError("Failed to connect to tracker. Check your network connection.")
-          
+
+def attempt_reconnection_thread():
+    while True:
+        time.sleep(1)
+        
+        with last_checkup_lock:
+            if last_checkup == None:
+                continue
+        
+        if time.time() - last_checkup < 11 * 60:
+            continue
+        
+        with last_checkup_lock:
+            last_checkup = None
+        
+        print("Lost connection to server, attempting to reconnect...")
+        
+        login_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        connect_socket_to_server(login_socket)
+        
+        login_socket.sendall(LoginRequest().to_bytes())
+        login_socket.close()
+        
+        print("Reconnected to server.")
+        
+
 def main():
     print("Welcome to CDL-BitTorrent!")
     print("Starting Up...")

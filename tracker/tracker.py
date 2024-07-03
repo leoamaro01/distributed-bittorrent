@@ -3,8 +3,11 @@ import socket
 from threading import Lock, Thread
 from utils.torrent_requests import *
 import hashlib
+import time
 
 CLIENT_COMMS_PORT = 7011
+
+CHECKUP_TIME = 5 * 60
 
 class Torrent:
     def __init__(self, torrent_id: str, peers: list[str], files: list[TorrentFileInfo], piece_size: int) -> None:
@@ -81,38 +84,13 @@ def handle_client(client: socket.socket, ip: str):
                 if ip not in users_online:
                     users_online.append(ip)
             
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.connect((ip, CLIENT_COMMS_PORT))
-                
-                sock.sendall(GetClientTorrentsRequest().to_bytes())
-                
-                res, res_type = TorrentRequest.recv_request(sock)
-                
-                if res_type != RT_CLIENT_TORRENTS_RESPONSE:
-                    return
-                
-                res: ClientTorrentsResponse
-
-                with user_torrents_lock:
-                    user_torrents[ip] = res.torrents
-
-                with torrents_lock:
-                    for torrent in res.torrents:
-                        if torrent in torrents and ip not in torrents[torrent].peers:
-                            torrents[torrent].peers.append(ip)
+            check_client(ip)
         elif req_type == RT_LOGOUT:
             with users_online_lock:
                 if ip in users_online:
                     users_online.remove(ip)
                     
-            if ip in user_torrents:
-                with user_torrents_lock:
-                    with torrents_lock:
-                        for torrent in user_torrents[ip]:
-                            if torrent in torrents and ip in torrents[torrent].peers:
-                                    torrents[torrent].peers.remove(ip)
-
-                    user_torrents.pop(ip)                        
+            erase_client_data(ip)                      
         elif req_type == RT_UPLOAD_TORRENT:
             req: UploadTorrentRequest
             
@@ -127,8 +105,84 @@ def handle_client(client: socket.socket, ip: str):
             
             client.sendall(UploadTorrentResponse(torrent_id).to_bytes())
 
+def client_check_thread():
+    while True:
+        time.sleep(CHECKUP_TIME)
+        
+        users = None
+        with users_online_lock:
+            users = users_online.copy()
+        
+        with ThreadPoolExecutor() as executor:
+            futures = [executor.submit(check_client, user) for user in users]
+            
+            for future in as_completed(futures):
+                result = future.result()
+                
+                is_online, user = result
+                
+                if not is_online:
+                    with users_online_lock:
+                        users_online.remove(user)
+                        
+                    erase_client_data(user)
+
+def erase_client_data(user: str):
+    with user_torrents_lock:
+        if user in user_torrents:
+            with torrents_lock:
+                for torrent in user_torrents[user]:
+                    if torrent in torrents and user in torrents[torrent].peers:
+                        torrents[torrent].peers.remove(user)
+            
+            user_torrents.pop(user)
+
+def check_client(ip: str) -> tuple[bool, str]:
+    """
+    Check if the client is still online
+    
+    Params:
+        ip: The IP of the client
+    
+    Returns:
+        A tuple with the first element being a boolean indicating if the client is still online and the second element being the IP of the client
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    try:
+        sock.connect((ip, CLIENT_COMMS_PORT))
+        
+        sock.sendall(GetClientTorrentsRequest().to_bytes())
+        
+        res, res_type = TorrentRequest.recv_request(sock)
+        
+        if res_type != RT_CLIENT_TORRENTS_RESPONSE:
+            return False, ip
+        
+        res: ClientTorrentsResponse
+        
+        erase_client_data(ip)
+        
+        with user_torrents_lock:
+            user_torrents[ip] = res.torrents
+
+        with torrents_lock:
+            for torrent in res.torrents:
+                if torrent in torrents and ip not in torrents[torrent].peers:
+                    torrents[torrent].peers.append(ip)
+        
+        return True, ip
+    except:
+        erase_client_data(ip)
+        return False, ip
+    finally:
+        sock.close()    
+
 def main():
     socket.setdefaulttimeout(5)
+    
+    check_thread = Thread(target=client_check_thread)
+    check_thread.start()
     
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
