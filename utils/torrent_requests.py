@@ -407,6 +407,38 @@ class PingRequest(TorrentRequest):
         return RT_PING.to_bytes()
 
 
+class GetServersRequest(TorrentRequest):
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["GetServersRequest", int] | None:
+        return GetServersRequest(), RT_GET_SERVERS
+
+    def to_bytes(self) -> bytes:
+        return RT_GET_SERVERS.to_bytes()
+
+
+class ServersResponse(TorrentRequest):
+    def __init__(self, server_ips: list[str]) -> None:
+        self.server_ips = server_ips
+
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["ServersResponse", int] | None:
+        server_count = int.from_bytes(recv_all(sock, 4))
+
+        servers = []
+        for _ in range(server_count):
+            servers.append(ip_from_bytes(recv_all(sock, 4)))
+
+        return ServersResponse(servers), RT_SERVERS_RESPONSE
+
+    def to_bytes(self) -> bytes:
+        servers = b""
+
+        for server in self.server_ips:
+            servers += ip_to_bytes(server)
+
+        return RT_SERVERS_RESPONSE.to_bytes() + len(self.server_ips).to_bytes(4) + servers
+
+
 # region Request IDs
 RT_PING = 0
 RT_STATUS = 1
@@ -424,6 +456,8 @@ RT_GET_CLIENT_TORRENTS = 12
 RT_CLIENT_TORRENTS_RESPONSE = 13
 RT_REGISTER_AS_PEER = 14
 RT_PIECE_DATA = 15
+RT_GET_SERVERS = 16
+RT_SERVERS_RESPONSE = 17
 
 requests = {
     RT_PING: PingRequest.recv_request,
@@ -442,5 +476,7 @@ requests = {
     RT_GET_PEERS: GetPeersRequest.recv_request,
     RT_GET_PEERS_RESPONSE: GetPeersResponse.recv_request,
     RT_PIECE_DATA: PieceDataResponse.recv_request,
+    RT_GET_SERVERS: GetServersRequest.recv_request,
+    RT_SERVERS_RESPONSE: ServersResponse.recv_request,
 }
 # endregion

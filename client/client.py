@@ -3,6 +3,7 @@ import socket
 import os
 import math
 import os.path as path
+from ssl import SOCK_STREAM
 from threading import Event, Lock, Thread
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from typing import Callable
@@ -222,6 +223,8 @@ CLIENT_CONNECTION_PORT = 7010
 PIECE_TRANSFER_TIMEOUT = 15
 
 DOWNLOAD_LOG_TIMESTEP = 0.5
+
+MIN_KNOWN_SERVERS = 20
 
 DISCOVERY_TIMEOUT = 5
 
@@ -690,6 +693,15 @@ def download_torrent(torrent_id: str):
             time.sleep(5)
             continue
 
+        with known_servers_lock:
+            low_servers = len(known_servers) < MIN_KNOWN_SERVERS
+
+        for p in peers:
+            with known_servers_lock:
+                if len(known_servers) >= MIN_KNOWN_SERVERS:
+                    break
+            learn_servers_from_peer(p)
+
         random.shuffle(pending_download_pieces)
 
         downloads = pending_download_pieces[:DOWNLOAD_CHUNKS]
@@ -1043,6 +1055,25 @@ def download_file_piece(
 # endregion
 
 # region Utilities
+
+
+def learn_servers_from_peer(peer: str):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.connect((peer, CLIENT_CONNECTION_PORT))
+
+            sock.sendall(GetServersRequest().to_bytes())
+            req, req_type = TorrentRequest.recv_request(sock)
+
+            if req_type == RT_SERVERS_RESPONSE:
+                req: ServersResponse
+
+                with known_servers_lock:
+                    for ip in req.server_ips:
+                        if ip not in known_servers:
+                            known_servers.append(ip)
+        except:
+            pass
 
 
 def connect_socket_to_server(
@@ -1404,7 +1435,15 @@ def handle_incoming_peer(sock: socket.socket, ip: str):
 
         sock.settimeout(socket.getdefaulttimeout())
 
-        if req_type == RT_DOWNLOAD_PIECE:
+        if req_type == RT_GET_SERVERS:
+            with known_servers_lock:
+                servers = known_servers.copy()
+
+            try:
+                sock.sendall(ServersResponse(servers).to_bytes())
+            except BaseException as e:
+                log(f"Failed to send response to peer. Error: {e}", f"PEER {ip}")
+        elif req_type == RT_DOWNLOAD_PIECE:
             req: DownloadPieceRequest
 
             with uploading_count_lock:
@@ -1946,15 +1985,35 @@ def attempt_reconnection_thread():
         time.sleep(5)
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            if connect_socket_to_server(sock):
-                with last_checkup_lock:
-                    if last_checkup == None or time.time() - last_checkup < 6 * 60:
-                        sock.sendall(PingRequest().to_bytes())
-                        continue
-            else:
+            if not connect_socket_to_server(sock):
                 log("Lost connection to server, reconnecting...", "RECONNECTION THREAD")
                 if not connect_socket_to_server(sock, True):
                     continue
+
+            with last_checkup_lock:
+                not_passed = last_checkup == None or time.time() - last_checkup < 2 * 60
+            if not_passed:
+                with known_servers_lock:
+                    low_servers = len(known_servers) < MIN_KNOWN_SERVERS
+
+                if low_servers:
+                    try:
+                        sock.sendall(GetServersRequest().to_bytes())
+                        req, req_type = TorrentRequest.recv_request(sock)
+
+                        if req_type == RT_SERVERS_RESPONSE:
+                            req: ServersResponse
+
+                            with known_servers_lock:
+                                for ip in req.server_ips:
+                                    if ip not in known_servers:
+                                        known_servers.append(ip)
+                    except:
+                        pass
+                    continue
+
+                sock.sendall(PingRequest().to_bytes())
+                continue
 
             with last_checkup_lock:
                 last_checkup = None

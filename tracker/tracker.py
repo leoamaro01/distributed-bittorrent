@@ -131,7 +131,7 @@ class Torrent:
 
 MAX_PEERS_TO_SEND = 50
 DISCOVERY_TIMEOUT = 5
-CHECKUP_TIME = 5 * 60
+CHECKUP_TIME = 60
 
 # endregion
 
@@ -422,6 +422,27 @@ def handle_client(client: socket.socket, ip: str):
                 DT_USER.to_bytes() + VT_USER_LOGIN.to_bytes(),
                 b"",
             )
+        elif req_type == RT_GET_SERVERS:
+            servers = []
+            with chord_node_lock:
+                if chord_node.pred != None:
+                    servers.append(chord_node.pred.ip)
+                with chord_node.successor_list_lock:
+                    succs = chord_node.successor_list.copy()
+                with chord_node.fingers_lock:
+                    fingers = chord_node.finger.copy()
+
+            for succ in succs:
+                if succ.ip not in servers:
+                    servers.append(succ.ip)
+
+            for f in fingers:
+                if f.ip not in servers:
+                    servers.append(f.ip)
+            try:
+                client.sendall(ServersResponse(servers).to_bytes())
+            except BaseException as e:
+                log(f"Failed to send response to client. Error: {e}", f"REQUEST {ip}")
         elif req_type == RT_GET_PEERS:
             log(f"Client requested peers", f"REQUEST {ip}")
             req: GetPeersRequest
