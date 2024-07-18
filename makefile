@@ -99,6 +99,14 @@ redeploy-client-cluster:
 	make build-client
 	make run-client-cluster
 
+prerun:
+	docker network create bittorrent-network || echo "Network already created"
+	docker volume create data-volume
+
+redeploy-holder-client:
+	make build-client
+	(docker stop bittorrent-client-holder && docker rm bittorrent-client-holder) || echo "Holder container not found."
+	docker run --mount source=data-volume,target=/app/data --name bittorrent-client-holder --network bittorrent-network -id bittorrent-client
 
 full-redeploy: redeploy-tracker redeploy-client
 
