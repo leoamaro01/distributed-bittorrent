@@ -1,6 +1,10 @@
-from unicurses import *
+import hashlib
+import random
+from re import L
 
-a = "a"
+a = []
 
-print(len(a))
-print(len(a.encode()))
+for i in range(1000000):
+    a.append((i))
+
+print("done")
