@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import socket
+from ssl import SOCK_STREAM
 from threading import Event, Lock, Thread
+import threading
 from typing import Callable
 from tracker_chord import (
     ChordNode,
@@ -16,14 +18,7 @@ import texts
 import time
 import random
 from queue import SimpleQueue
-
-# region Constants
-
-MAX_PEERS_TO_SEND = 50
-
-CHECKUP_TIME = 5 * 60
-
-# endregion
+from sys import argv
 
 
 class Torrent:
@@ -131,6 +126,14 @@ class Torrent:
 
         return Torrent(id, peers, dirs, files, piece_size)
 
+
+# region Constants
+
+MAX_PEERS_TO_SEND = 50
+DISCOVERY_TIMEOUT = 5
+CHECKUP_TIME = 5 * 60
+
+# endregion
 
 # region Data
 
@@ -343,7 +346,7 @@ def handle_client(client: socket.socket, ip: str):
 
             if info == None:
                 log(f"Torrent {req.torrent_id} not found", f"REQUEST {ip}")
-                info = TorrentInfo(req.torrent_id, [], [], 0)
+                info = TorrentInfo.invalid(req.torrent_id)
 
             try:
                 client.sendall(TorrentInfoResponse(info).to_bytes())
@@ -429,6 +432,11 @@ def handle_client(client: socket.socket, ip: str):
 
             bytes_index = 0
 
+            log(
+                f"Requested peers for torrent {req.torrent_id}, received bytes {peers_bytes} from chord.",
+                f"REQUEST {ip}",
+            )
+
             def get_bytes(_bytes: int) -> bytes:
                 nonlocal bytes_index
                 ret = peers_bytes[bytes_index : bytes_index + _bytes]
@@ -436,18 +444,34 @@ def handle_client(client: socket.socket, ip: str):
                 return ret
 
             if peers_bytes == b"":
+                log(
+                    "Its empty",
+                    f"REQUEST {ip}",
+                )
                 peers = []
             else:
                 peers_count = int.from_bytes(get_bytes(4))
 
+                log(
+                    f"Its {peers_count} peers.",
+                    f"REQUEST {ip}",
+                )
+
                 peers = []
                 for _ in range(peers_count):
-                    peers.append(ip_from_bytes(get_bytes(4)))
+                    ip = ip_from_bytes(get_bytes(4))
+                    log(
+                        f"Adding {ip}",
+                        f"REQUEST {ip}",
+                    )
+                    peers.append(ip)
 
             if ip in peers:
+                log("Removing peer from ips", f"REQUEST {ip}")
                 peers.remove(ip)
 
             try:
+                log("Sending to peer", f"REQUEST {ip}")
                 client.sendall(GetPeersResponse(peers).to_bytes())
             except BaseException as e:
                 log(f"Failed to send response to client. Error: {e}", f"REQUEST {ip}")
@@ -492,6 +516,11 @@ def print_help(args: list[str]):
     print(texts.help_text)
 
 
+def chord_data(args: list[str]):
+    with chord_node_lock:
+        print(str(chord_node))
+
+
 def delete_torrent(args: list[str]):
     if len(args) == 0:
         print(
@@ -526,8 +555,16 @@ def list_peers(args: list[str]):
         print(texts.list_peers_help)
         return
 
+    print("Own users:")
     with users_online_lock:
         for i, peer in enumerate(users_online):
+            print(peer, end="\n" if (i + 1) % 5 == 0 else "\t")
+
+    print()
+
+    print("Replica users:")
+    with users_online_replica_lock:
+        for i, peer in enumerate(users_online_replica):
             print(peer, end="\n" if (i + 1) % 5 == 0 else "\t")
 
     print("")
@@ -538,8 +575,15 @@ def list_torrents(args: list[str]):
         print(texts.list_torrents_help)
         return
 
+    print("Own torrents:")
     with torrents_lock:
         print("\n".join(torrents.keys()))
+
+    print()
+
+    print("Replica torrents:")
+    with torrents_replica_lock:
+        print("\n".join(torrents_replica.keys()))
 
 
 def info_command(args: list[str]):
@@ -579,6 +623,7 @@ commands: dict[str, Callable] = {
     "list-peers": list_peers,
     "list-torrents": list_torrents,
     "info": info_command,
+    "chord": chord_data,
 }
 
 # endregion
@@ -774,17 +819,12 @@ def try_retrieve_data_internal(
 
 
 def retrieve_data(key_bytes: bytes, key_options: bytes) -> bytes:
-    log("Asked to retrieve data", "CHORD")
     data = try_retrieve_data_internal(
         key_bytes, key_options, torrents, torrents_lock, users_online, users_online_lock
     )
 
     if data != None:
-        log("Valid data, sending...", "CHORD")
-
         return data
-
-    log("Searching in replica", "CHORD")
 
     data = try_retrieve_data_internal(
         key_bytes,
@@ -798,24 +838,43 @@ def retrieve_data(key_bytes: bytes, key_options: bytes) -> bytes:
     return data if data != None else b""
 
 
+def own_replica_and_forward(key: str, is_torrent: bool):
+    if is_torrent:
+        with torrents_lock:
+            with torrents_replica_lock:
+                torrents[key] = torrents_replica[key]
+                torrent_bytes = torrents[key].to_bytes()
+                torrents_replica.pop(key)
+        with chord_node_lock:
+            with chord_node.successor_list_lock:
+                successors = chord_node.successor_list.copy()
+        for succ in successors:
+            replicate_torrent(key, torrent_bytes, succ)
+    else:
+        with users_online_lock:
+            with users_online_replica_lock:
+                users_online.append(key)
+                users_online_replica.remove(key)
+        with chord_node_lock:
+            with chord_node.successor_list_lock:
+                successors = chord_node.successor_list.copy()
+        for succ in successors:
+            replicate_user(key, succ)
+
+
 def own_replica(data_start: int, data_end: int):
     with torrents_replica_lock:
         replicas = torrents_replica.copy()
-        for torrent in replicas:
-            key_hash = get_sha_for_bytes(torrent.encode())
-            if inbetween(key_hash, data_start, data_end):
-                with torrents_lock:
-                    torrents[torrent] = torrents_replica[torrents]
-                torrents_replica.pop(torrent)
+    for torrent in replicas:
+        key_hash = get_sha_for_bytes(torrent.encode())
+        if inbetween(key_hash, data_start, data_end):
+            own_replica_and_forward(torrent, True)
     with users_online_replica_lock:
         replicas = users_online_replica.copy()
-        for user in replicas:
-            ip_hash = get_sha_for_bytes(ip_to_bytes(user))
-            if inbetween(ip_hash, data_start, data_end):
-                with users_online_lock:
-                    if user not in users_online:
-                        users_online.append(user)
-                users_online_replica.remove(user)
+    for user in replicas:
+        ip_hash = get_sha_for_bytes(ip_to_bytes(user))
+        if inbetween(ip_hash, data_start, data_end):
+            own_replica_and_forward(user, False)
 
 
 def delete_replica(data_start: int, data_end: int):
@@ -902,13 +961,16 @@ def replicate_torrent(
 ):
     successor.store_key_replica(
         torrent_id.encode(),
-        DT_TORRENT.to_bytes() + VT_NEW_TORRENT.to_bytes() + torrent_bytes,
+        DT_TORRENT.to_bytes() + VT_NEW_TORRENT.to_bytes(),
+        torrent_bytes,
     )
 
 
 def replicate_user(user_ip: str, successor: ChordNodeReference):
     successor.store_key_replica(
-        ip_to_bytes(user_ip), DT_USER.to_bytes() + VT_USER_LOGIN.to_bytes()
+        ip_to_bytes(user_ip),
+        DT_USER.to_bytes() + VT_USER_LOGIN.to_bytes(),
+        b"",
     )
 
 
@@ -953,11 +1015,74 @@ def update_successors(
 
 # endregion
 
+# region Multicast Receiving
+
+
+def receive_multicast_request(data: bytes, ip: str):
+    if len(data) < 10:
+        return
+
+    id = data[:6].decode()
+
+    if id not in ["client", "server"]:
+        return
+
+    if ip_from_bytes(data[6:10]) != ip:
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        my_ip = socket.gethostbyname(socket.gethostname())
+
+        try:
+            sock.connect(
+                (ip, SERVER_DISCOVERY_PORT if id == "server" else CLIENT_DISCOVERY_PORT)
+            )
+
+            sock.sendall(b"discovery" + ip_to_bytes(my_ip))
+        except:
+            return
+
+
+def multicast_receiver():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Set the socket options to enable multicast
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    # Specify the multicast group and port
+    multicast_group = "224.0.0.1"
+    port = SERVER_MULTICAST_PORT
+
+    # Bind the socket to the multicast group and port
+    sock.bind(("", port))
+
+    # Join the multicast group
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        socket.inet_aton(multicast_group) + socket.inet_aton("0.0.0.0"),
+    )
+
+    # Receive and print incoming multicast messages
+    while True:
+        data, address = sock.recvfrom(10)
+
+        threading.Thread(
+            target=receive_multicast_request, args=[data, address[0]]
+        ).start()
+
+
+# endregion
+
 
 def main():
     global chord_node
     print("Welcome to CDL-BitTorrent Server!")
     print("Starting up...")
+
+    logger_thread = Thread(target=logger, daemon=True)
+    logger_thread.start()
 
     ip = socket.gethostbyname(socket.gethostname())
 
@@ -973,10 +1098,79 @@ def main():
         log=log,
     )
 
-    # TODO: DISCOVERY!!
+    if "--nodiscovery" not in argv:
+        servers = []
 
-    logger_thread = Thread(target=logger, daemon=True)
-    logger_thread.start()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            multicast_group = "224.0.0.1"
+            port = SERVER_MULTICAST_PORT
+
+            discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            discovery_socket.bind(("", SERVER_DISCOVERY_PORT))
+            discovery_socket.settimeout(3)
+
+            discovery_socket.listen(10)
+
+            # send discovery message
+            sock.sendto(b"server" + ip_to_bytes(ip), (multicast_group, port))
+            sock.close()
+
+            # wait for other servers to respond
+            start_wait_time = time.time()
+
+            while time.time() - start_wait_time < DISCOVERY_TIMEOUT:
+                try:
+                    conn, addr = discovery_socket.accept()
+                except TimeoutError:
+                    continue
+
+                try:
+                    # should receive "discovery" + the ip, so 13 bytes
+                    data = conn.recv(13)
+
+                    if len(data) < 13:
+                        continue
+
+                    if data[:9].decode() != "discovery":
+                        continue
+
+                    if ip_from_bytes(data[9:13]) != addr[0]:
+                        continue
+
+                    servers.append(addr[0])
+
+                    conn.close()
+                except:
+                    continue
+        except BaseException as e:
+            print(f"Error at discovery: {e}")
+
+        if len(servers) == 0:
+            log("Failed to find any servers through discovery", "DISCOVERY")
+            print("Failed to find any servers through discovery")
+        else:
+            joined = False
+            for server in servers:
+                try:
+                    chord_node.join(ChordNodeReference(server))
+                except RuntimeError:
+                    continue
+                else:
+                    joined = True
+                    break
+            if not joined:
+                log("Failed to join any server through discovery", "DISCOVERY")
+                print("Failed to join any server through discovery")
+
+    multicast_thread = Thread(target=multicast_receiver, daemon=True)
+    multicast_thread.start()
 
     check_thread = Thread(target=client_check_thread, daemon=True)
     check_thread.start()

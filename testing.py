@@ -1,10 +1,9 @@
-import hashlib
-import random
-from re import L
+import socket
+from threading import Thread
 
-a = []
+from utils.utils import ip_from_bytes, ip_to_bytes
 
-for i in range(1000000):
-    a.append((i))
-
-print("done")
+ip = "1.2.3.4"
+btes = ip_to_bytes(ip)
+print(btes)
+print(ip_from_bytes(btes))

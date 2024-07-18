@@ -12,6 +12,7 @@ import texts
 from utils.utils import *
 import time
 import random
+from sys import argv
 
 # region Download Status
 
@@ -222,6 +223,8 @@ PIECE_TRANSFER_TIMEOUT = 15
 
 DOWNLOAD_LOG_TIMESTEP = 0.5
 
+DISCOVERY_TIMEOUT = 5
+
 DOWNLOAD_CHUNKS = 10
 
 UPLOAD_MAX = 40
@@ -254,6 +257,9 @@ torrent_infos: dict[str, TorrentInfo] = {}
 torrent_infos_lock: Lock = Lock()
 
 connected_to_server: Event = Event()
+
+known_servers: list[str] = []
+known_servers_lock: Lock = Lock()
 
 # endregion
 
@@ -1055,41 +1061,69 @@ def connect_socket_to_server(
         else:
             return False
 
-    try:
-        socket.connect(("bittorrent-tracker", SERVER_PORT))
-    except:
-        if not connected_to_server.is_set():
-            if block_on_disconnect:
-                while not exit_event.is_set():
-                    if connected_to_server.wait(5):
-                        break
-                return connect_socket_to_server(socket, True)
-            else:
-                return False
+    with known_servers_lock:
+        servers = known_servers.copy()
 
-        if not block_on_disconnect:
+    socket.settimeout(1)
+
+    for server in servers:
+        try:
+            socket.connect((server, SERVER_PORT))
+        except:
+            with known_servers_lock:
+                if server in known_servers:
+                    known_servers.remove(server)
+            continue
+        else:
+            return True
+
+    if not connected_to_server.is_set():
+        if block_on_disconnect:
+            while not exit_event.is_set():
+                if connected_to_server.wait(5):
+                    break
+            return connect_socket_to_server(socket, True)
+        else:
             return False
 
-        connected_to_server.clear()
+    if not block_on_disconnect:
+        return False
 
-        while not exit_event.is_set():
-            log(
-                "Failed to connect to server. Trying again in 5 seconds...",
-                "SERVER CONNECTION",
-            )
-            time.sleep(5)
-            try:
-                log("Trying to connect to server...", "SERVER CONNECTION")
-                socket.connect(("bittorrent-tracker", SERVER_PORT))
-                log("Connected to server", "SERVER CONNECTION")
+    connected_to_server.clear()
+
+    while not exit_event.is_set():
+        servers = discover_servers()
+
+        if len(servers) > 0:
+            servers_cp = servers.copy()
+
+            connected = False
+            for server in servers_cp:
+                try:
+                    log(f"Trying to connect to server {server}...", "SERVER CONNECTION")
+                    socket.connect((server, SERVER_PORT))
+                    log("Connected to server", "SERVER CONNECTION")
+                    with known_servers_lock:
+                        known_servers.extend(servers)
+                    connected = True
+                    break
+                except:
+                    servers.remove(server)
+
+            if connected:
                 break
-            except:
-                continue
 
-        if exit_event.is_set():
-            return False
+        log(
+            "Failed to connect to servers. Trying again in 5 seconds...",
+            "SERVER CONNECTION",
+        )
+        time.sleep(5)
+        continue
 
-        connected_to_server.set()
+    if exit_event.is_set():
+        return False
+
+    connected_to_server.set()
 
     return True
 
@@ -1207,10 +1241,10 @@ def get_torrent_info(torrent_id: str, block_on_disconnect: bool = False) -> Torr
 
         try:
             req, req_type = TorrentRequest.recv_request(sock)
-        except:
+        except BaseException as e:
             if block_on_disconnect:
                 log(
-                    "Failed to get torrent info after a successful connection to the server. Retrying...",
+                    f"Failed to get torrent info after a successful connection to the server. Error: {e}. Retrying...",
                     "GET TORRENT INFO",
                 )
                 return get_torrent_info(torrent_id, True)
@@ -1723,7 +1757,7 @@ def join_download_command(args: list[str]):
         torrent_id = args[0]
     else:
         print("Select the download to join from the following list:")
-
+        print()
         for i, (torrent_id, status) in enumerate(downloads):
             st = ""
             if status.finished:
@@ -1742,6 +1776,7 @@ def join_download_command(args: list[str]):
             print(f"{i + 1}: {torrent_id} ({st})")
 
         while True:
+            print()
             try:
                 inp = (
                     input(
@@ -1929,6 +1964,67 @@ def attempt_reconnection_thread():
             log("Reconnected to server", "RECONNECTION THREAD")
 
 
+def discover_servers() -> list[str]:
+    servers = []
+    ip = socket.gethostbyname(socket.gethostname())
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        multicast_group = "224.0.0.1"
+        port = SERVER_MULTICAST_PORT
+
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        discovery_socket.bind(("", CLIENT_DISCOVERY_PORT))
+        discovery_socket.settimeout(3)
+
+        discovery_socket.listen(10)
+
+        # send discovery message
+        sock.sendto(b"client" + ip_to_bytes(ip), (multicast_group, port))
+        sock.close()
+
+        # wait for other servers to respond
+        start_wait_time = time.time()
+
+        while time.time() - start_wait_time < DISCOVERY_TIMEOUT:
+            try:
+                conn, addr = discovery_socket.accept()
+            except TimeoutError:
+                continue
+
+            try:
+                # should receive "discovery" + the ip, so 13 bytes
+                data = conn.recv(13)
+
+                if len(data) < 13:
+                    continue
+
+                if data[:9].decode() != "discovery":
+                    continue
+
+                if ip_from_bytes(data[9:13]) != addr[0]:
+                    continue
+
+                servers.append(addr[0])
+
+                conn.close()
+            except:
+                continue
+    except BaseException as e:
+        log(f"Error at discovery: {e}", "DISCOVERY")
+
+    if len(servers) == 0:
+        log("Failed to find any servers through discovery", "DISCOVERY")
+
+    return servers
+
+
 # endregion
 
 
@@ -1942,8 +2038,14 @@ def main():
 
     load_config()
 
-    print("Logging in to server...")
-    log("Logging in to server...", "MAIN")
+    print("Finding servers...")
+    log("Finding servers...", "DISCOVERY")
+
+    if "--nodiscovery" not in argv:
+        servers = discover_servers()
+
+        with known_servers_lock:
+            known_servers.extend(servers)
 
     logging_thread = Thread(target=logger, name="logging", daemon=True)
     logging_thread.start()
@@ -1960,6 +2062,9 @@ def main():
         target=attempt_reconnection_thread, name="reconnection", daemon=True
     )
     reconnection_thread.start()
+
+    print("Logging in to server...")
+    log("Logging in to server...", "MAIN")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as login_socket:
         if not connect_socket_to_server(login_socket):

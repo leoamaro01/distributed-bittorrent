@@ -5,7 +5,10 @@ from os import path
 from typing import Any, Callable
 
 SERVER_PORT = 8080
+SERVER_MULTICAST_PORT = 8085
 SERVER_COMMS_PORT = 7011
+SERVER_DISCOVERY_PORT = 8090
+CLIENT_DISCOVERY_PORT = 7020
 
 # region Standards
 # standard piece size: 256kB

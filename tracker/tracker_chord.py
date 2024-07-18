@@ -1,3 +1,4 @@
+from concurrent.futures import thread
 import socket
 import threading
 import sys
@@ -21,6 +22,7 @@ STORE_KEY_REPLICA = 9
 RETRIEVE_KEY = 10
 GET_SUCCESSOR_LIST = 11
 DELETE_FROM_REPLICA = 12
+GET_START = 13
 
 
 def get_sha_repr(data: str):
@@ -59,10 +61,12 @@ class ChordNodeReference:
     ) -> bytes:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
                 s.connect((self.ip, self.port))
                 req = op.to_bytes() + len(data).to_bytes(4) + data
                 s.sendall(req)
                 if expect_response:
+                    s.settimeout(20)
                     res_len = int.from_bytes(recv_all(s, 4))
                     return recv_all(s, res_len)
                 else:
@@ -111,6 +115,10 @@ class ChordNodeReference:
     def pred(self) -> "ChordNodeReference":
         return node_from_bytes(self._send_data(GET_PREDECESSOR))
 
+    @property
+    def start(self) -> int:
+        return int.from_bytes(self._send_data(GET_START))
+
     # Method to notify the current node about another node
     def notify(self, node: "ChordNodeReference"):
         self._send_data(NOTIFY, node_to_bytes(node), False)
@@ -149,7 +157,7 @@ class ChordNodeReference:
         return self._send_data(RETRIEVE_KEY, len(key).to_bytes(4) + key + key_options)
 
     def __str__(self) -> str:
-        return f"{self.id},{self.ip},{self.port}"
+        return f"{self.ip},{self.port}"
 
     def __repr__(self) -> str:
         return str(self)
@@ -206,13 +214,16 @@ class ChordNode:
         self.port = port
         self.ref = ChordNodeReference(self.ip, self.port, log=log)
         self.succ = self.ref  # Initial successor is itself
+        self.succ_lock: threading.Lock = threading.Lock()
         self.successor_list = (
             []
         )  # Successor list used for replication and fault tolerance
+        self.successor_list_lock: threading.Lock = threading.Lock()
         self.replication = replication  # Number of replicas
         self.pred = None  # Initially no predecessor
         self.m = m  # Number of bits in the hash/key space
         self.finger = [self.ref] * self.m  # Finger table
+        self.fingers_lock: threading.Lock = threading.Lock()
         self.next = 0  # Finger table index to fix next
         self.store_data_func = store_data_func  # Function to store data
         self.store_replica_func = store_replica_func  # Function to store data replicas
@@ -225,6 +236,7 @@ class ChordNode:
         self.update_succs_func = update_succs_func  # Function to update successors
         self.log = log  # Function to log messages
         self.start_id = self.id  # Index of the lowest key in the node's data
+        self.pred_start = None
 
         # Start background threads for stabilization, fixing fingers, and checking predecessor
         threading.Thread(
@@ -250,8 +262,8 @@ class ChordNode:
 
     # Method to find the predecessor of a given id
     def find_pred(self, id: int) -> "ChordNodeReference":
-        node = self
-        last_node = self
+        node = self.ref
+        last_node = self.ref
         # this loop advances 2 nodes at a time, so that if a fail occurs,
         # we can go back one step instead of starting from the beginning
         # (if both die, we just reset to the start)
@@ -266,9 +278,6 @@ class ChordNode:
 
                 continue
 
-            # this doesn't enter a loop since if node == node.closest_preceding_finger, then
-            # node == node.succ (if it wasn't then node != noed.closest_preceding_finger, see function below),
-            # then the _inbetween call below will succeed.
             if inbetween(id, node.id, succ.id):
                 break
 
@@ -286,107 +295,116 @@ class ChordNode:
 
     # Method to find the closest preceding finger of a given id
     def closest_preceding_finger(self, id: int) -> "ChordNodeReference":
-        successor_list_index = len(self.successor_list) - 1
+        with self.fingers_lock:
+            for i in range(self.m - 1, -1, -1):
+                if (
+                    self.finger[i]
+                    and inbetween(self.finger[i].id, self.id, id)
+                    and self.finger[i].ping()
+                ):
+                    return self.finger[i]
 
-        # this loop goes down the finger list and the successor list at the same time,
-        # making sure that if low-index fingers are down, the successor list can make up for it
-        # keeping up the eficiency of the Chord algorithm
-        for i in range(self.m - 1, -1, -1):
-            if not self.finger[i] or not self.finger[i].ping():
-                continue
+        with self.successor_list_lock:
+            succ_list = self.successor_list.copy()
 
-            while (
-                successor_list_index >= 0
-                and self.finger[i].id < self.successor_list[successor_list_index].id
-            ):
-                suc = self.successor_list[successor_list_index]
-                if inbetween(suc.id, self.id, id) and suc.ping():
-                    return suc
-                successor_list_index -= 1
-
-            if (
-                inbetween(self.finger[i].id, self.id, id)
-                and self.finger[i]
-                and self.finger[i].ping()
-            ):
-                return self.finger[i]
+        for s in succ_list:
+            if inbetween(s.id, self.id, id):
+                return s
 
         return self.ref
-
-    def get_successor_list(self) -> list["ChordNodeReference"]:
-        return self.successor_list
 
     # Method to join a Chord network using 'node' as an entry point
     def join(self, node: "ChordNodeReference"):
         self.pred = None
         if node:
-            self.succ = node.find_successor(self.id)
-            # this means node died, so we can't join the network
-            if self.succ == None:
-                raise RuntimeError(f"Can't reach node {node.ip}. Can't join network.")
+            with self.succ_lock:
+                self.succ = node.find_successor(self.id)
+                # this means node died, so we can't join the network
+                if self.succ == None:
+                    raise RuntimeError(
+                        f"Can't reach node {node.ip}. Can't join network."
+                    )
 
-            succ_succs = self.succ.get_successor_list()
+                succ_succs = self.succ.get_successor_list()
 
             if len(succ_succs) > self.replication - 1:
                 self.successor_list = succ_succs[: self.replication - 1]
 
-            self.successor_list = [self.succ] + self.successor_list
+            with self.succ_lock:
+                with self.successor_list_lock:
+                    succ_succs = self.succ.get_successor_list()
+                    if len(succ_succs) > self.replication - 1:
+                        succ_succs = succ_succs[: self.replication - 1]
+                    self.successor_list = [self.succ] + succ_succs
 
-            self.succ.notify(self.ref)
+                self.succ.notify(self.ref)
         else:
-            self.succ = self.ref
+            with self.succ_lock:
+                self.succ = self.ref
+
+    def fix_succ(self):
+        with self.succ_lock:
+            succ_pinged = self.succ.id != self.id and self.succ.ping()
+
+        if not succ_pinged:
+            fixed = False
+            with self.successor_list_lock:
+                succs = self.successor_list.copy()
+            for succ in succs:
+                if succ.ping():
+                    with self.succ_lock:
+                        self.succ = succ
+                        fixed = True
+                        break
+                else:
+                    with self.successor_list_lock:
+                        if succ in self.successor_list:
+                            self.successor_list.remove(succ)
+            if not fixed:
+                with self.succ_lock:
+                    self.succ = self.ref
 
     # Stabilize method to periodically verify and update the successor and predecessor
     def stabilize(self):
         while True:
-            succs = self.successor_list.copy()
-            for s in succs:
-                if not s.ping():
-                    self.successor_list.remove(s)
+            self.fix_succ()
 
-            succ_list_index = 0
-            while succ_list_index < len(self.successor_list) and (
-                not self.succ.ping() or self.succ.id == self.id
-            ):
-                self.succ = self.successor_list[succ_list_index]
-                succ_list_index += 1
-
-            if succ_list_index == -1 and not self.succ.ping():
-                self.succ = self.ref
-
-            x = self.succ.pred
-            if x == None:
-                if self.succ.id != self.id:
-                    if (
-                        not self.succ.ping()
-                    ):  # it died, go through the successor list again
-                        continue
+            with self.succ_lock:
+                x = self.succ.pred
+                if x and x.id != self.id:
+                    if inbetween(x.id, self.id, self.succ.id):
+                        self.succ = x
                     self.succ.notify(self.ref)
-            elif x.id != self.id:
-                if inbetween(x.id, self.id, self.succ.id):
-                    self.succ = x
-                self.succ.notify(self.ref)
 
+            self.succ_lock.acquire()
             if self.succ.id != self.id:
                 succ_succs_list = self.succ.get_successor_list()
+                self.succ_lock.release()
+
+                while self.ref in succ_succs_list:
+                    succ_succs_list.remove(self.ref)
 
                 if len(succ_succs_list) > self.replication - 1:
                     succ_succs_list = succ_succs_list[: self.replication - 1]
 
-                old = self.successor_list
-                self.successor_list = [self.succ] + succ_succs_list
-
                 removed = []
                 added = []
 
-                for s in self.successor_list:
+                with self.successor_list_lock:
+                    old = self.successor_list
+                    new_list = [self.succ] + succ_succs_list
+                    self.successor_list = new_list
+
+                for s in new_list:
                     if s not in old:
                         added.append(s)
                 for s in old:
-                    if s not in self.successor_list:
+                    if s not in new_list:
                         removed.append(s)
 
                 self.update_succs_func(added, removed)
+            else:
+                self.succ_lock.release()
 
             time.sleep(10)
 
@@ -402,6 +420,12 @@ class ChordNode:
                     self.start_id, self.pred.id
                 )
             self.transfer_data_func(self.start_id, self.pred.id, self.pred)
+            self.start_id = self.pred.id
+            pred_start = self.pred.start
+            if pred_start == self.pred.id:
+                self.pred_start = None
+            else:
+                self.pred_start = pred_start
 
     # Fix fingers method to periodically update the finger table
     def fix_fingers(self):
@@ -409,18 +433,29 @@ class ChordNode:
             self.next += 1
             if self.next >= self.m:
                 self.next = 0
-            self.finger[self.next] = self.find_succ(
-                (self.id + 2**self.next) % 2**self.m
-            )
-            time.sleep(10)
+
+            succ = self.find_succ((self.id + 2**self.next) % 2**self.m)
+            with self.fingers_lock:
+                self.finger[self.next] = succ
+            time.sleep(5)
 
     # Check predecessor method to periodically verify if the predecessor is alive
     def check_predecessor(self):
         while True:
             if self.pred:
                 if not self.pred.ping():
+                    # own data that used to belong to pred
+                    if self.pred_start != None:
+                        self.own_replica_func(self.pred_start, self.pred.id)
+
                     self.pred = None
-            time.sleep(10)
+                else:
+                    pred_start = self.pred.start
+                    if pred_start == self.pred.id:
+                        self.pred_start = None
+                    else:
+                        self.pred_start = pred_start
+            time.sleep(5)
 
     # Store key method to store a key-value pair and replicate to the successor
     def store_key(self, key: bytes, key_options: bytes, value: bytes):
@@ -435,10 +470,8 @@ class ChordNode:
         return node.retrieve_key(key, key_options)
 
     def handle_connection(self, conn: socket.socket):
-        self.log("Received connection", "IN CHORD")
         option = int.from_bytes(recv_all(conn, 1))
         data_len = int.from_bytes(recv_all(conn, 4))
-        self.log(f"Option {option}, Data Length {data_len}", "IN CHORD")
         data = recv_all(conn, data_len)
 
         data_resp = None
@@ -450,9 +483,13 @@ class ChordNode:
             id = int.from_bytes(data)
             data_resp = self.find_pred(id)
         elif option == GET_SUCCESSOR:
-            data_resp = self.succ if self.succ else self.ref
+            self.fix_succ()
+            with self.succ_lock:
+                data_resp = node_to_bytes(self.succ)
         elif option == GET_PREDECESSOR:
             data_resp = self.pred if self.pred else self.ref
+        elif option == GET_START:
+            data_resp = self.start_id.to_bytes(32)
         elif option == NOTIFY:
             self.notify(node_from_bytes(data))
         elif option == PING:
@@ -463,16 +500,24 @@ class ChordNode:
         elif option == STORE_KEY:
             keylen = int.from_bytes(data[:4])
             key = data[4 : 4 + keylen]
+
             key_options = data[4 + keylen : 6 + keylen]
+
             value = data[6 + keylen :]
+
             self.store_data_func(key, key_options, value)
-            for succ in self.successor_list:
-                succ.store_key_replica(key, key_options, value)
+
+            with self.successor_list_lock:
+                for succ in self.successor_list:
+                    succ.store_key_replica(key, key_options, value)
         elif option == STORE_KEY_REPLICA:
             keylen = int.from_bytes(data[:4])
             key = data[4 : 4 + keylen]
+
             key_options = data[4 + keylen : 6 + keylen]
+
             value = data[6 + keylen :]
+
             self.store_replica_func(key, key_options, value)
         elif option == DELETE_FROM_REPLICA:
             start = int.from_bytes(data[:32])
@@ -484,21 +529,16 @@ class ChordNode:
             key_options = data[4 + keylen :]
             data_resp = self.retrieve_data_func(key, key_options)
         elif option == GET_SUCCESSOR_LIST:
-            succs = self.get_successor_list()
+            with self.successor_list_lock:
+                succs = self.successor_list.copy()
             data_resp = len(succs).to_bytes(4)
             for s in succs:
                 data_resp += node_to_bytes(s)
-        else:
-            self.log("Could not find any operation with that ID", "IN CHORD")
 
-        if data_resp:
-            self.log("Has response", "IN CHORD")
+        if data_resp != None:
             if isinstance(data_resp, ChordNodeReference):
-                self.log("Is a node", "IN CHORD")
                 data_resp = node_to_bytes(data_resp)
-            self.log("Sending response", "IN CHORD")
             conn.sendall(len(data_resp).to_bytes(4) + data_resp)
-            self.log("Response sent", "IN CHORD")
 
         conn.close()
 
@@ -506,7 +546,6 @@ class ChordNode:
     def start_server(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.log(f"Starting chord server at {self.ip}:{self.port}", "IN CHORD")
             s.bind((self.ip, self.port))
             s.listen(5)
 
@@ -516,6 +555,12 @@ class ChordNode:
                 threading.Thread(
                     target=self.handle_connection, args=[conn], daemon=False
                 ).start()
+
+    def __str__(self) -> str:
+        with self.successor_list_lock:
+            succs = "\n".join(str(f) for f in self.successor_list)
+        with self.succ_lock:
+            return f"pred: {self.pred},\nsucc:\n{self.succ},\nsuccessors: \n{succs}"
 
 
 if __name__ == "__main__":
