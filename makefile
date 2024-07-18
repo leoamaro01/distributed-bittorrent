@@ -60,9 +60,9 @@ run-tracker-in-cluster:
 run-tracker-cluster:
 	make run-tracker-in-cluster INDEX=0
 	make run-tracker-in-cluster INDEX=1
-	# make run-tracker-in-cluster INDEX=2
-	# make run-tracker-in-cluster INDEX=3
-	# make run-tracker-in-cluster INDEX=4
+	make run-tracker-in-cluster INDEX=2
+	make run-tracker-in-cluster INDEX=3
+	make run-tracker-in-cluster INDEX=4
 
 redeploy-tracker-cluster:
 	make stop-tracker-cluster
@@ -106,8 +106,8 @@ prerun:
 redeploy-holder-client:
 	make build-client
 	(docker stop bittorrent-client-holder && docker rm bittorrent-client-holder) || echo "Holder container not found."
-	docker run --mount source=data-volume,target=/app/data --name bittorrent-client-holder --network bittorrent-network -id bittorrent-client
+	docker run --mount source=data-volume,target=/app/data --name bittorrent-client-holder --network bittorrent-network -p 7010:7010 -p 7011:7011 -id bittorrent-client
 
 full-redeploy: redeploy-tracker redeploy-client
 
-.PHONY: redeploy-tracker-cluster run-tracker-cluster run-tracker-in-cluster stop-tracker-cluster stop-tracker-from-cluster redeploy-client-cluster run-client-cluster stop-client-from-cluster stop-client-cluster run-client-in-cluster build stop remove build-tracker build-client run-client run-tracker stop-client stop-tracker remove-client remove-tracker redeploy-tracker redeploy-client
+.PHONY: redeploy-holder-client prerun redeploy-tracker-cluster run-tracker-cluster run-tracker-in-cluster stop-tracker-cluster stop-tracker-from-cluster redeploy-client-cluster run-client-cluster stop-client-from-cluster stop-client-cluster run-client-in-cluster build stop remove build-tracker build-client run-client run-tracker stop-client stop-tracker remove-client remove-tracker redeploy-tracker redeploy-client
