@@ -19,6 +19,12 @@ run-client:
 run-tracker:
 	docker run --name bittorrent-tracker --network bittorrent-network -p 8080:8080 -p 8085:8085 -p 8090:8090 -id bittorrent-tracker
 
+run-tracker-custom:
+	docker run --name $(CONTAINER_NAME) --network bittorrent-network -i bittorrent-tracker
+
+run-client-custom:
+	docker run --name $(CONTAINER_NAME) --network bittorrent-network -i bittorrent-client
+
 stop-client:
 	make stop CONTAINER_NAME=bittorrent-client
 
