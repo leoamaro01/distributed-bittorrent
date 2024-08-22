@@ -1072,7 +1072,7 @@ def multicast_receiver():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     # Specify the multicast group and port
-    multicast_group = "224.0.0.1"
+    multicast_group = "224.0.0.10"
     port = SERVER_MULTICAST_PORT
 
     # Bind the socket to the multicast group and port
@@ -1128,7 +1128,7 @@ def main():
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            multicast_group = "224.0.0.1"
+            multicast_group = "224.0.0.10"
             port = SERVER_MULTICAST_PORT
 
             discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
