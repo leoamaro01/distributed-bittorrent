@@ -1,10 +1,13 @@
+from calendar import c
 from concurrent.futures import thread
+from os import remove
 import socket
 import threading
 import sys
 import time
 import hashlib
 from typing import Callable
+from tracker.tracker import own_replica
 from utils.utils import recv_all, ip_from_bytes, ip_to_bytes
 
 CHORD_NODES_PORT = 8081
@@ -23,6 +26,7 @@ RETRIEVE_KEY = 10
 GET_SUCCESSOR_LIST = 11
 DELETE_FROM_REPLICA = 12
 GET_START = 13
+GET_PREDECESSOR_LIST = 14
 
 
 def get_sha_repr(data: str):
@@ -104,6 +108,29 @@ class ChordNodeReference:
             )  # a node is 36 bytes, 32 for the key and 4 for the ip
 
         return succ_list
+
+    def get_predecessor_list(self) -> list["ChordNodeReference"]:
+        response = self._send_data(GET_PREDECESSOR_LIST)
+        if response == None:
+            return None
+
+        response_index = 0
+
+        def get_response(_bytes: int):
+            nonlocal response_index
+            ret = response[response_index : response_index + _bytes]
+            response_index += _bytes
+            return ret
+
+        pred_count = int.from_bytes(get_response(4))
+
+        pred_list = []
+        for _ in range(pred_count):
+            pred_list.append(
+                node_from_bytes(get_response(36))
+            )  # a node is 36 bytes, 32 for the key and 4 for the ip
+
+        return pred_list
 
     # Property to get the successor of the current node
     @property
@@ -218,6 +245,10 @@ class ChordNode:
         self.successor_list = (
             []
         )  # Successor list used for replication and fault tolerance
+        self.predecessor_list: list[ChordNodeReference] = (
+            []
+        )  # Used to update owned replicas and easily get a new predecessor when the current one dies
+        self.predecessor_list_lock: threading.Lock = threading.Lock()
         self.successor_list_lock: threading.Lock = threading.Lock()
         self.replication = replication  # Number of replicas
         self.pred = None  # Initially no predecessor
@@ -325,11 +356,6 @@ class ChordNode:
                         f"Can't reach node {node.ip}. Can't join network."
                     )
 
-                succ_succs = self.succ.get_successor_list()
-
-            if len(succ_succs) > self.replication - 1:
-                self.successor_list = succ_succs[: self.replication - 1]
-
             with self.succ_lock:
                 with self.successor_list_lock:
                     succ_succs = self.succ.get_successor_list()
@@ -342,6 +368,7 @@ class ChordNode:
             with self.succ_lock:
                 self.succ = self.ref
 
+    # Method to fix the successor of the current node
     def fix_succ(self):
         with self.succ_lock:
             succ_pinged = self.succ.id != self.id and self.succ.ping()
@@ -364,7 +391,7 @@ class ChordNode:
                 with self.succ_lock:
                     self.succ = self.ref
 
-    # Stabilize method to periodically verify and update the successor and predecessor
+    # Stabilize method to periodically verify and update the successor
     def stabilize(self):
         while True:
             self.fix_succ()
@@ -406,26 +433,47 @@ class ChordNode:
             else:
                 self.succ_lock.release()
 
-            time.sleep(10)
+            time.sleep(1)
 
     # Notify method to inform the node about another node
     def notify(self, node: "ChordNodeReference"):
         if node.id == self.id:
-            pass
+            return
+
+        if not node.ping():
+            return
+
         if not self.pred or inbetween(node.id, self.pred.id, self.id):
             self.pred = node
             self.own_replica_func(self.pred.id, self.id)
+
             if len(self.successor_list) == self.replication:
                 self.successor_list[self.replication - 1].remove_replica(
                     self.start_id, self.pred.id
                 )
+
             self.transfer_data_func(self.start_id, self.pred.id, self.pred)
+
             self.start_id = self.pred.id
+
             pred_start = self.pred.start
             if pred_start == self.pred.id:
                 self.pred_start = None
             else:
                 self.pred_start = pred_start
+
+            pred_preds = self.pred.get_predecessor_list()
+
+            new_preds = [self.pred]
+
+            for i in range(min(self.replication - 1, len(pred_preds))):
+                if pred_preds[i].id == self.id:
+                    break
+
+                new_preds.append(pred_preds[i])
+
+            with self.predecessor_list_lock:
+                self.predecessor_list = new_preds
 
     # Fix fingers method to periodically update the finger table
     def fix_fingers(self):
@@ -437,7 +485,7 @@ class ChordNode:
             succ = self.find_succ((self.id + 2**self.next) % 2**self.m)
             with self.fingers_lock:
                 self.finger[self.next] = succ
-            time.sleep(5)
+            time.sleep(1)
 
     # Check predecessor method to periodically verify if the predecessor is alive
     def check_predecessor(self):
@@ -449,13 +497,46 @@ class ChordNode:
                         self.own_replica_func(self.pred_start, self.pred.id)
 
                     self.pred = None
+
+                    with self.predecessor_list_lock:
+                        pred_list = self.predecessor_list.copy()
+
+                    for pred in pred_list:
+                        if pred.ping():
+                            self.notify(pred)
+                        else:
+                            with self.predecessor_list_lock:
+                                self.predecessor_list.remove(pred)
+
+                    if self.pred == None:
+                        potential_pred = self.find_pred(self.id)
+                        if potential_pred.id == self.id:
+                            # own all data, we (think) are the only node in the chord
+                            own_replica(0, 2**self.m)
                 else:
                     pred_start = self.pred.start
                     if pred_start == self.pred.id:
                         self.pred_start = None
                     else:
                         self.pred_start = pred_start
-            time.sleep(5)
+
+                    pred_preds = self.pred.get_predecessor_list()
+
+                    if pred_preds == None:
+                        continue
+
+                    new_preds = [self.pred]
+
+                    for i in range(min(self.replication - 1, len(pred_preds))):
+                        if pred_preds[i].id == self.id:
+                            break
+
+                        new_preds.append(pred_preds[i])
+
+                    with self.predecessor_list_lock:
+                        self.predecessor_list = new_preds
+
+            time.sleep(1)
 
     # Store key method to store a key-value pair and replicate to the successor
     def store_key(self, key: bytes, key_options: bytes, value: bytes):
@@ -533,6 +614,12 @@ class ChordNode:
                 succs = self.successor_list.copy()
             data_resp = len(succs).to_bytes(4)
             for s in succs:
+                data_resp += node_to_bytes(s)
+        elif option == GET_PREDECESSOR_LIST:
+            with self.predecessor_list_lock:
+                preds = self.predecessor_list.copy()
+            data_resp = len(preds).to_bytes(4)
+            for s in preds:
                 data_resp += node_to_bytes(s)
 
         if data_resp != None:
