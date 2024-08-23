@@ -143,13 +143,15 @@ class ChordNodeReference:
 
     @property
     def start(self) -> int:
-        return int.from_bytes(self._send_data(GET_START))
+        data = self._send_data(GET_START)
+        if data == None:
+            return None
+        return int.from_bytes(data)
 
     # Method to notify the current node about another node
     def notify(self, node: "ChordNodeReference"):
         self._send_data(NOTIFY, node_to_bytes(node), False)
 
-    # Method to check if the predecessor is alive
     def ping(self) -> bool:
         return self._send_data(PING, expect_response=False) == b""
 
@@ -439,10 +441,17 @@ class ChordNode:
         if node.id == self.id:
             return
 
-        if not node.ping():
-            return
-
         if not self.pred or inbetween(node.id, self.pred.id, self.id):
+            pred_start = self.pred.start
+
+            if pred_start == None:
+                return
+
+            pred_preds = self.pred.get_predecessor_list()
+
+            if pred_preds == None:
+                return
+
             self.pred = node
             self.own_replica_func(self.pred.id, self.id)
 
@@ -455,13 +464,10 @@ class ChordNode:
 
             self.start_id = self.pred.id
 
-            pred_start = self.pred.start
             if pred_start == self.pred.id:
                 self.pred_start = None
             else:
                 self.pred_start = pred_start
-
-            pred_preds = self.pred.get_predecessor_list()
 
             new_preds = [self.pred]
 
@@ -514,6 +520,10 @@ class ChordNode:
                             self.own_replica_func(0, 2**self.m)
                 else:
                     pred_start = self.pred.start
+
+                    if pred_start == None:
+                        continue
+
                     if pred_start == self.pred.id:
                         self.pred_start = None
                     else:
