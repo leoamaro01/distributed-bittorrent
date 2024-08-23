@@ -704,7 +704,8 @@ def download_torrent(torrent_id: str):
 
         random.shuffle(pending_download_pieces)
 
-        downloads = pending_download_pieces[:DOWNLOAD_CHUNKS]
+        if len(pending_download_pieces) > DOWNLOAD_CHUNKS:
+            downloads = pending_download_pieces[:DOWNLOAD_CHUNKS]
 
         with download_statuses_lock:
             download_statuses[torrent_id].set_status("Downloading...")
@@ -757,183 +758,209 @@ def download_torrent(torrent_id: str):
                 else:
                     downloaded[file] = [piece]
 
-                # region File reconstruction
-                if len(pending_download_files[file]) == 0:
-                    pending_download_files.pop(file)
+        if len(pending_download_files) == 0:
+            with download_statuses_lock:
+                download_statuses[torrent_id].set_status(
+                    "Download finished. Reconstructing files..."
+                )
 
+            log(
+                f"Download finished, reconstructing files...",
+                category=f"DOWNLOAD {torrent_id}",
+            )
+
+            any_failed = False
+
+            # region File reconstruction
+            for file in range(len(info.files)):
+                if exited:
+                    any_failed = True
+                    break
+
+                pending_download_files.pop(file)
+
+                log(
+                    f"Reconstructing {file}...",
+                    category=f"DOWNLOAD {torrent_id}",
+                )
+
+                file_name = path.join(
+                    f"downloads/{torrent_id}", info.files[file].file_name
+                )
+
+                os.makedirs(path.dirname(file_name), exist_ok=True)
+
+                failed = False
+                closed = False
+
+                open_file_with_lock(file_name)
+
+                try:
+                    fl = open(file_name, "wb")
+                except BaseException as e:
                     log(
-                        f"File {file} finished downloading, checking integrity and reconstructing...",
+                        f"Failed to open file, cancelling reconstruction... Error: {e}",
                         f"DOWNLOAD {torrent_id}",
                     )
+                    with download_statuses_lock:
+                        download_statuses[torrent_id].set_error(
+                            f"Failed to open file {file_name}. Error: {e}"
+                        )
+                        download_statuses[torrent_id].cancel_event.set()
+                    exited = True
+                    close_file_with_lock(file_name)
+                    continue
 
-                    file_name = path.join(
-                        f"downloads/{torrent_id}", info.files[file].file_name
+                file_hex = get_hex(file)
+
+                def fail_func(piece_index: int):
+                    pending_download_pieces.append((file, piece_index))
+                    if file in pending_download_files:
+                        pending_download_files[file].append(piece_index)
+                    else:
+                        pending_download_files[file] = [piece_index]
+                    downloaded[file].remove(piece_index)
+                    with download_statuses_lock:
+                        download_statuses[torrent_id].cancel_download(file, piece_index)
+
+                for piece_index in range(len(info.files[file].piece_hashes)):
+                    piece_hex = get_hex(piece_index)
+                    piece_path = (
+                        f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}"
                     )
-                    os.makedirs(path.dirname(file_name), exist_ok=True)
 
-                    failed = False
-                    closed = False
-
-                    open_file_with_lock(file_name)
-
-                    try:
-                        fl = open(file_name, "wb")
-                    except BaseException as e:
+                    if not path.isfile(piece_path):
                         log(
-                            f"Failed to open file, cancelling download... Error: {e}",
+                            f"Found missing piece file ({file}, {piece_index}), should be at {piece_path}. Resubmitting to download queue...",
                             f"DOWNLOAD {torrent_id}",
                         )
-                        with download_statuses_lock:
-                            download_statuses[torrent_id].set_error(
-                                f"Failed to open file {file_name}. Error: {e}"
-                            )
-                            download_statuses[torrent_id].cancel_event.set()
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        exited = True
-                        close_file_with_lock(file_name)
+                        failed = True
+                        fail_func(piece_index)
                         continue
 
-                    file_hex = get_hex(file)
-
-                    def fail_func(piece_index: int):
-                        pending_download_pieces.append((file, piece_index))
-                        if file in pending_download_files:
-                            pending_download_files[file].append(piece_index)
-                        else:
-                            pending_download_files[file] = [piece_index]
-                        downloaded[file].remove(piece_index)
-                        with download_statuses_lock:
-                            download_statuses[torrent_id].cancel_download(
-                                file, piece_index
-                            )
-
-                    for piece_index in range(len(info.files[file].piece_hashes)):
-                        piece_hex = get_hex(piece_index)
-                        piece_path = (
-                            f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}"
+                    if path.getsize(piece_path) > PIECE_SIZE:
+                        log(
+                            f"Found piece file ({file}, {piece_index}) at {piece_path} with invalid size. Resubmitting to download queue...",
+                            f"DOWNLOAD {torrent_id}",
                         )
-
-                        if not path.isfile(piece_path):
-                            log(
-                                f"Found missing piece file ({file}, {piece_index}), should be at {piece_path}. Resubmitting to download queue...",
-                                f"DOWNLOAD {torrent_id}",
-                            )
-                            failed = True
-                            fail_func(piece_index)
-                            continue
-
-                        if path.getsize(piece_path) > PIECE_SIZE:
-                            log(
-                                f"Found piece file ({file}, {piece_index}) at {piece_path} with invalid size. Resubmitting to download queue...",
-                                f"DOWNLOAD {torrent_id}",
-                            )
-                            try:
-                                os.remove(piece_path)
-                            except:
-                                log(
-                                    f"Failed to remove piece file {piece_path}.",
-                                    f"DOWNLOAD {torrent_id}",
-                                )
-                            failed = True
-                            fail_func(piece_index)
-                            continue
-
-                        open_file_with_lock(piece_path)
                         try:
-                            with open(piece_path, "rb") as f:
-                                piece_data = f.read()
+                            os.remove(piece_path)
                         except:
                             log(
-                                f"Failed to read piece file {piece_path}. Resubmitting to download queue...",
+                                f"Failed to remove piece file {piece_path}.",
                                 f"DOWNLOAD {torrent_id}",
                             )
-                            try:
-                                os.remove(piece_path)
-                            except:
-                                log(
-                                    f"Failed to remove piece file {piece_path}.",
-                                    f"DOWNLOAD {torrent_id}",
-                                )
-                            failed = True
-                            fail_func(piece_index)
-                            continue
-                        finally:
-                            close_file_with_lock(piece_path)
-
-                        if not check_piece_hash(
-                            piece_data, info.files[file].piece_hashes[piece_index]
-                        ):
-                            log(
-                                f"Piece file {piece_path} has invalid hash. Resubmitting to download queue...",
-                                f"DOWNLOAD {torrent_id}",
-                            )
-                            try:
-                                os.remove(piece_path)
-                            except:
-                                log(
-                                    f"Failed to remove piece file {piece_path}.",
-                                    f"DOWNLOAD {torrent_id}",
-                                )
-                            failed = True
-                            fail_func(piece_index)
-                            continue
-
-                        if not failed:
-                            fl.write(piece_data)
-                        elif not closed:
-                            fl.close()
-                            close_file_with_lock(file_name)
-
-                    if failed:
-                        log(
-                            f"Some parts of file {file} couldn't be veryfied to be correct and will be downloaded again. File was not reconstructed.",
-                            f"DOWNLOAD {torrent_id}",
-                        )
+                        failed = True
+                        fail_func(piece_index)
                         continue
 
+                    open_file_with_lock(piece_path)
+                    try:
+                        with open(piece_path, "rb") as f:
+                            piece_data = f.read()
+                    except:
+                        log(
+                            f"Failed to read piece file {piece_path}. Resubmitting to download queue...",
+                            f"DOWNLOAD {torrent_id}",
+                        )
+                        try:
+                            os.remove(piece_path)
+                        except:
+                            log(
+                                f"Failed to remove piece file {piece_path}.",
+                                f"DOWNLOAD {torrent_id}",
+                            )
+                        failed = True
+                        fail_func(piece_index)
+                        continue
+                    finally:
+                        close_file_with_lock(piece_path)
+
+                    if not check_piece_hash(
+                        piece_data, info.files[file].piece_hashes[piece_index]
+                    ):
+                        log(
+                            f"Piece file {piece_path} has invalid hash. Resubmitting to download queue...",
+                            f"DOWNLOAD {torrent_id}",
+                        )
+                        try:
+                            os.remove(piece_path)
+                        except:
+                            log(
+                                f"Failed to remove piece file {piece_path}.",
+                                f"DOWNLOAD {torrent_id}",
+                            )
+                        failed = True
+                        fail_func(piece_index)
+                        continue
+
+                    if not failed:
+                        fl.write(piece_data)
+                    elif not closed:
+                        closed = True
+                        fl.close()
+                        close_file_with_lock(file_name)
+
+                if not closed:
                     fl.close()
                     close_file_with_lock(file_name)
 
+                if failed:
                     log(
-                        f"File {file} reconstructed. Removing partial files.",
+                        f"Some parts of file {file} couldn't be veryfied to be correct and will be downloaded again. File was not reconstructed.",
                         f"DOWNLOAD {torrent_id}",
                     )
+                    any_failed = True
 
-                    # remove partial piece files
-                    for piece_index in range(len(info.files[file].piece_hashes)):
-                        piece_hex = get_hex(piece_index)
-                        p_path = (
-                            f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}"
-                        )
-                        open_file_with_lock(p_path)
-                        try:
-                            os.remove(p_path)
-                        except:
-                            log(
-                                f"Failed to remove piece file {p_path}. Continuing...",
-                                f"DOWNLOAD {torrent_id}",
-                            )
-                            continue
-                        finally:
-                            close_file_with_lock(p_path)
+                    continue
 
-                    log(
-                        f"Partial files for file {file} removed.",
-                        f"DOWNLOAD {torrent_id}",
-                    )
+                if any_failed:
+                    continue
 
-                    # remove partial file folder
+                log(
+                    f"File {file} reconstructed. Removing partial files.",
+                    f"DOWNLOAD {torrent_id}",
+                )
+
+                # remove partial piece files
+                for piece_index in range(len(info.files[file].piece_hashes)):
+                    piece_hex = get_hex(piece_index)
+                    p_path = f"downloads/.partial/{torrent_id}/{file_hex}/{piece_hex}"
+                    open_file_with_lock(p_path)
                     try:
-                        fldr = f"downloads/.partial/{torrent_id}/{file_hex}"
-                        os.rmdir(fldr)
+                        os.remove(p_path)
                     except:
                         log(
-                            f"Failed to remove partial files folder {fldr}. Continuing...",
+                            f"Failed to remove piece file {p_path}. Continuing...",
                             f"DOWNLOAD {torrent_id}",
                         )
-                # endregion
+                        continue
+                    finally:
+                        close_file_with_lock(p_path)
 
-        if len(pending_download_files) == 0:
+                log(
+                    f"Partial files for file {file} removed.",
+                    f"DOWNLOAD {torrent_id}",
+                )
+
+                # remove partial file folder
+                try:
+                    fldr = f"downloads/.partial/{torrent_id}/{file_hex}"
+                    os.rmdir(fldr)
+                except:
+                    log(
+                        f"Failed to remove partial files folder {fldr}. Continuing...",
+                        f"DOWNLOAD {torrent_id}",
+                    )
+            # endregion
+
+            if any_failed:
+                log(
+                    f"Reconstruction of some files failed. Restarting download of failed files...",
+                    f"DOWNLOAD {torrent_id}",
+                )
+                continue
+
             with download_statuses_lock:
                 download_statuses[torrent_id].end()
 
