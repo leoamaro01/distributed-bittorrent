@@ -7,7 +7,6 @@ import sys
 import time
 import hashlib
 from typing import Callable
-from tracker.tracker import own_replica
 from utils.utils import recv_all, ip_from_bytes, ip_to_bytes
 
 CHORD_NODES_PORT = 8081
@@ -512,7 +511,7 @@ class ChordNode:
                         potential_pred = self.find_pred(self.id)
                         if potential_pred.id == self.id:
                             # own all data, we (think) are the only node in the chord
-                            own_replica(0, 2**self.m)
+                            self.own_replica_func(0, 2**self.m)
                 else:
                     pred_start = self.pred.start
                     if pred_start == self.pred.id:
@@ -646,8 +645,11 @@ class ChordNode:
     def __str__(self) -> str:
         with self.successor_list_lock:
             succs = "\n".join(str(f) for f in self.successor_list)
+        with self.predecessor_list_lock:
+            preds = "\n".join(str(f) for f in self.predecessor_list)
+
         with self.succ_lock:
-            return f"pred: {self.pred},\nsucc:\n{self.succ},\nsuccessors: \n{succs}"
+            return f"pred: {self.pred}\nsucc:\n{self.succ}\npredecssors: \n {preds}\nsuccessors: \n{succs}"
 
 
 if __name__ == "__main__":
