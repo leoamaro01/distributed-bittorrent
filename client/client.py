@@ -462,6 +462,8 @@ def upload_torrent(torrent_path: str) -> bool:
 
 
 def download_torrent(torrent_id: str):
+    my_ip = socket.gethostbyname(socket.gethostname())
+
     # region Download preparations
     log("Starting download", f"DOWNLOAD {torrent_id}")
 
@@ -693,8 +695,8 @@ def download_torrent(torrent_id: str):
             time.sleep(5)
             continue
 
-        with known_servers_lock:
-            low_servers = len(known_servers) < MIN_KNOWN_SERVERS
+        if my_ip in peers:
+            peers.remove(my_ip)
 
         for p in peers:
             with known_servers_lock:
@@ -1165,7 +1167,11 @@ def connect_socket_to_server(
                         known_servers.extend(servers)
                     connected = True
                     break
-                except:
+                except BaseException as e:
+                    log(
+                        f"Failed to connect to server {server}. Error: {e}",
+                        "SERVER CONNECTION",
+                    )
                     servers.remove(server)
 
             if connected:
