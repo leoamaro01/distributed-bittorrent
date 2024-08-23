@@ -442,12 +442,12 @@ class ChordNode:
             return
 
         if not self.pred or inbetween(node.id, self.pred.id, self.id):
-            pred_start = self.pred.start
+            pred_start = node.start
 
             if pred_start == None:
                 return
 
-            pred_preds = self.pred.get_predecessor_list()
+            pred_preds = node.get_predecessor_list()
 
             if pred_preds == None:
                 return
