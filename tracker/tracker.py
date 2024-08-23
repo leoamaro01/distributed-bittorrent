@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import socket
 from ssl import SOCK_STREAM
+from tabnanny import check
 from threading import Event, Lock, Thread
 import threading
 from typing import Callable
@@ -129,9 +130,10 @@ class Torrent:
 
 # region Constants
 
+CLIENT_CHECKUP_TIMEOUT = 2
 MAX_PEERS_TO_SEND = 50
 DISCOVERY_TIMEOUT = 5
-CHECKUP_TIME = 60
+CHECKUP_TIME = 5
 
 # endregion
 
@@ -206,6 +208,8 @@ def check_client(ip: str) -> tuple[bool, str]:
     log("Starting client checkup", f"CHECKUP {ip}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(CLIENT_CHECKUP_TIMEOUT)
+
         try:
             sock.connect((ip, SERVER_COMMS_PORT))
         except BaseException as e:
@@ -266,12 +270,14 @@ def check_client(ip: str) -> tuple[bool, str]:
 
 def client_check_thread():
     while not exit_event.is_set():
-        time.sleep(CHECKUP_TIME)
-
         log("Starting client checkup...", "CHECKUP")
 
         with users_online_lock:
             users = users_online.copy()
+
+        if len(users) == 0:
+            time.sleep(CHECKUP_TIME)
+            continue
 
         exited = False
 
@@ -291,27 +297,20 @@ def client_check_thread():
                 is_online, user = result
 
                 if not is_online:
-                    with users_online_lock:
-                        if user in users_online:
-                            users_online.remove(user)
-
-                    with user_torrents_lock:
-                        if user in user_torrents:
-                            torrents_from_user = user_torrents[user]
-                        else:
-                            torrents_from_user = []
-                        user_torrents.pop(user)
-
-                    for torrent in torrents_from_user:
-                        store_key_on_chord(
-                            torrent.encode(),
-                            DT_TORRENT.to_bytes() + VT_REMOVE_PEER.to_bytes(),
-                            ip_to_bytes(user),
-                        )
+                    store_key_on_chord(
+                        ip_to_bytes(user),
+                        DT_USER.to_bytes() + VT_USER_LOGOUT.to_bytes(),
+                        b"",
+                    )
 
                 if not exited and exit_event.is_set():
                     exited = True
                     executor.shutdown(wait=False, cancel_futures=True)
+
+        if exited:
+            return
+
+        time.sleep(CHECKUP_TIME)
 
 
 # endregion
