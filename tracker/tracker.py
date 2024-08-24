@@ -1,7 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import socket
-from ssl import SOCK_STREAM
-from tabnanny import check
 from threading import Event, Lock, Thread
 import threading
 from typing import Callable
@@ -9,7 +7,6 @@ from tracker_chord import (
     ChordNode,
     ChordNodeReference,
     get_sha_for_bytes,
-    get_sha_repr,
     inbetween,
 )
 from utils.torrent_requests import *
@@ -132,7 +129,7 @@ class Torrent:
 
 CLIENT_CHECKUP_TIMEOUT = 2
 MAX_PEERS_TO_SEND = 50
-DISCOVERY_TIMEOUT = 5
+DISCOVERY_TIMEOUT = 2
 CHECKUP_TIME = 5
 
 # endregion
@@ -204,9 +201,6 @@ def to_torrent_info(torrent: Torrent):
 
 
 def check_client(ip: str) -> tuple[bool, str]:
-
-    log("Starting client checkup", f"CHECKUP {ip}")
-
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(CLIENT_CHECKUP_TIMEOUT)
 
@@ -264,14 +258,11 @@ def check_client(ip: str) -> tuple[bool, str]:
             ip_to_bytes(ip),
         )
 
-    log("Client checkup finished", f"CHECKUP {ip}")
     return True, ip
 
 
 def client_check_thread():
     while not exit_event.is_set():
-        log("Starting client checkup...", "CHECKUP")
-
         with users_online_lock:
             users = users_online.copy()
 
@@ -479,12 +470,8 @@ def handle_client(client: socket.socket, ip: str):
 
                 peers = []
                 for _ in range(peers_count):
-                    ip = ip_from_bytes(get_bytes(4))
-                    log(
-                        f"Adding {ip}",
-                        f"REQUEST {ip}",
-                    )
-                    peers.append(ip)
+                    p = ip_from_bytes(get_bytes(4))
+                    peers.append(p)
 
             if ip in peers:
                 log("Removing peer from ips", f"REQUEST {ip}")
@@ -493,6 +480,46 @@ def handle_client(client: socket.socket, ip: str):
             try:
                 log("Sending to peer", f"REQUEST {ip}")
                 client.sendall(GetPeersResponse(peers).to_bytes())
+            except BaseException as e:
+                log(f"Failed to send response to client. Error: {e}", f"REQUEST {ip}")
+
+            store_key_on_chord(
+                ip_to_bytes(ip), DT_USER.to_bytes() + VT_USER_LOGIN.to_bytes(), b""
+            )
+        elif req_type == RT_GET_ALL_TORRENTS:
+            log("Client requested all torrents", f"REQUEST {ip}")
+
+            with chord_node_lock:
+                log(
+                    "Starting chain request on chord for all torrents...",
+                    f"REQUEST {ip}",
+                )
+                all_torrents_bytes = chord_node.get_all_data(DT_TORRENT.to_bytes(1))
+
+            bytes_read = 0
+
+            def read_data(count: int) -> bytes:
+                nonlocal bytes_read
+                data = all_torrents_bytes[bytes_read : bytes_read + count]
+                bytes_read += count
+                return data
+
+            count = int.from_bytes(read_data(4))
+
+            torrent_ids_names: list[tuple[str, str]] = []
+
+            for _ in range(count):
+                id_len = int.from_bytes(read_data(4))
+                id = read_data(id_len).decode()
+                name_len = int.from_bytes(read_data(4))
+                name = read_data(name_len).decode()
+
+                if (id, name) not in torrent_ids_names:
+                    torrent_ids_names.append((id, name))
+
+            try:
+                log("Sending to peer", f"REQUEST {ip}")
+                client.sendall(AllTorrentsResponse(torrent_ids_names).to_bytes())
             except BaseException as e:
                 log(f"Failed to send response to client. Error: {e}", f"REQUEST {ip}")
 
@@ -661,34 +688,81 @@ VT_NEW_TORRENT = 2
 VT_REMOVE_TORRENT = 3
 VT_USER_LOGOUT = 4
 VT_USER_LOGIN = 5
+VT_USER_TRANSFER = 6
 
 # Retrieve Value types:
 VT_GET_TORRENT_INFO = 0
 VT_GET_PEERS = 1
 
 
+def get_all_data(key_options: bytes) -> bytes:
+    data_type = int.from_bytes(key_options[:1])
+
+    if data_type == DT_TORRENT:
+        with torrents_lock:
+            torrents_cp = torrents.copy()
+
+        count = len(torrents_cp)
+
+        torr_data = count.to_bytes(4)
+
+        for torr in torrents_cp.values():
+            torr_data += len(torr.torrent_id).to_bytes(4)
+            torr_data += torr.torrent_id.encode()
+
+            name = (
+                torr.dirs[0].split("/")[0]
+                if len(torr.dirs) > 0
+                else torr.files[0].file_name.split("/")[0]
+            )
+
+            torr_data += len(name).to_bytes(4)
+            torr_data += name.encode()
+
+        log(f"All data bytes: {torr_data}", "ALL DATA")
+
+        return torr_data
+    elif data_type == DT_USER:
+        with users_online_lock:
+            users = users_online.copy()
+
+        count = len(users)
+
+        users_data = count.to_bytes(4)
+
+        for user in users:
+            users_data += ip_to_bytes(user)
+
+        return users_data
+
+
 def store_key_on_chord(
     key_bytes: bytes, key_options: bytes, value_bytes: bytes
 ) -> None:
-    log("Sent to store key on chord", "CHORD")
+    log("Sent to store key on chord", "CHORD STORE")
     with chord_node_lock:
         succ: ChordNodeReference = chord_node.find_succ(get_sha_for_bytes(key_bytes))
 
-    log(f"Found successor at {succ.ip}", "CHORD")
+    log(f"Found successor at {succ.ip}", "CHORD STORE")
 
     while not succ.store_key(key_bytes, key_options, value_bytes):
-        log(f"Failed to store, trying again", "CHORD")
+        log(f"Failed to store, trying again", "CHORD STORE")
         succ = chord_node.find_succ(get_sha_for_bytes(key_bytes))
-        log(f"Found successor at {succ.ip}", "CHORD")
+        log(f"Found successor at {succ.ip}", "CHORD STORE")
 
 
 def retrieve_key_from_chord(key_bytes: bytes, key_options: bytes) -> bytes:
-    log("Retrieving a key")
+    log("Retrieving a key", "CHORD RETRIEVE")
     with chord_node_lock:
         succ: ChordNodeReference = chord_node.find_succ(get_sha_for_bytes(key_bytes))
+
+    log(f"Found successor at {succ.ip}", "CHORD RETRIEVE")
+
     value = succ.retrieve_key(key_bytes, key_options)
     while value == None:
+        log(f"Failed to retrieve, trying again", "CHORD RETRIEVE")
         succ: ChordNodeReference = chord_node.find_succ(get_sha_for_bytes(key_bytes))
+        log(f"Found successor at {succ.ip}", "CHORD RETRIEVE")
         value = succ.retrieve_key(key_bytes, key_options)
     return value
 
@@ -761,7 +835,9 @@ def store_data_internal(
                     users_online.remove(user)
 
             with user_torrents_lock:
-                torrents_from_user = user_torrents[user]
+                torrents_from_user = (
+                    user_torrents[user] if user in user_torrents else []
+                )
 
             for torrent in torrents_from_user:
                 store_key_on_chord(
@@ -769,6 +845,35 @@ def store_data_internal(
                     DT_TORRENT.to_bytes() + VT_REMOVE_PEER.to_bytes(),
                     key_bytes,
                 )
+        elif value_type == VT_USER_TRANSFER:
+            log("User transferred", "CHORD")
+            with user_torrents_lock:
+                with users_online_lock:
+                    bytes_read = 0
+
+                    def read_value(_bytes: int):
+                        nonlocal bytes_read
+                        data = value_bytes[bytes_read : bytes_read + _bytes]
+                        bytes_read += _bytes
+                        return data
+
+                    torrents_count = int.from_bytes(read_value(4))
+
+                    torrs = []
+
+                    for _ in range(torrents_count):
+                        length = read_value(1)
+                        torrs.append(read_value(length).decode())
+
+                    if user not in users_online:
+                        users_online.append(user)
+
+                    if user in user_torrents:
+                        user_torrents[user].extend(torrs)
+                    else:
+                        user_torrents[user] = torrs
+
+            check_client(user)
 
 
 def store_data(key_bytes: bytes, key_options: bytes, value_bytes: bytes) -> None:
@@ -925,10 +1030,22 @@ def transfer_torrent(
 
 
 def transfer_user(user_ip: str, target: ChordNodeReference) -> tuple[int, str] | None:
+    user_torrents_bytes = b""
+
+    with user_torrents_lock:
+        torr_count = len(user_torrents[user_ip]) if user_ip in user_torrents else 0
+
+        user_torrents_bytes += torr_count.to_bytes()
+
+        if torr_count > 0:
+            for torr in user_torrents[user_ip]:
+                user_torrents_bytes += len(torr).to_bytes(1)
+                user_torrents_bytes += torr.encode()
+
     if target.store_key(
         ip_to_bytes(user_ip),
-        DT_USER.to_bytes() + VT_USER_LOGIN.to_bytes(),
-        b"",
+        DT_USER.to_bytes() + VT_USER_TRANSFER.to_bytes(),
+        user_torrents_bytes,
     ):
         return DT_USER, user_ip
     return None
@@ -938,22 +1055,27 @@ def transfer_data(data_start: int, data_end: int, target: ChordNodeReference):
     with ThreadPoolExecutor() as executor:
         futures = []
         with torrents_lock:
-            for torrent in torrents:
-                key_hash = get_sha_for_bytes(torrent.encode())
-                if inbetween(key_hash, data_start, data_end):
-                    futures.append(
-                        executor.submit(
-                            transfer_torrent,
-                            torrent,
-                            torrents[torrent].to_bytes(),
-                            target,
-                        )
+            torrents_cp = torrents.copy()
+
+        for torrent in torrents_cp:
+            key_hash = get_sha_for_bytes(torrent.encode())
+            if inbetween(key_hash, data_start, data_end):
+                futures.append(
+                    executor.submit(
+                        transfer_torrent,
+                        torrent,
+                        torrents[torrent].to_bytes(),
+                        target,
                     )
+                )
+
         with users_online_lock:
-            for user in users_online:
-                ip_hash = get_sha_for_bytes(ip_to_bytes(user))
-                if inbetween(ip_hash, data_start, data_end):
-                    futures.append(executor.submit(transfer_user, user, target))
+            users = users_online.copy()
+
+        for user in users:
+            ip_hash = get_sha_for_bytes(ip_to_bytes(user))
+            if inbetween(ip_hash, data_start, data_end):
+                futures.append(executor.submit(transfer_user, user, target))
 
         for future in as_completed(futures):
             if future.cancelled():
@@ -1115,10 +1237,31 @@ def main():
         store_replica_func=store_replica,
         transfer_data_func=transfer_data,
         update_succs_func=update_successors,
+        get_all_data_func=get_all_data,
         log=log,
     )
 
-    if "--nodiscovery" not in argv:
+    direct = False
+
+    if "--direct" in argv:
+        server_index = argv.index("--direct") + 1
+        if len(argv) <= server_index:
+            print(
+                "If you are using the --direct option you must also specify a server address."
+            )
+        else:
+            server_ip = argv[server_index]
+
+            try:
+                chord_node.join(ChordNodeReference(server_ip))
+            except RuntimeError:
+                print(
+                    "Failed to connect to server specified with the --direct option. Will attempt discovery next..."
+                )
+            else:
+                direct = True
+
+    if "--nodiscovery" not in argv and not direct:
         servers = []
 
         try:

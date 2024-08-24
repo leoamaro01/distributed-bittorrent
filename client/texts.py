@@ -7,6 +7,7 @@ help_text = """Commands in the CDL-BitTorrent Client CLI:
     join-download    Shows live logs of a download.
     cancel-download  Cancels a download in progress.
     seed             Registers this client as a seeder for an existing torrent.
+    browse-torrents  Shows a list with every available torrent
     exit             Closes the client.
 """
 
@@ -55,3 +56,9 @@ Usage:
     upload [PATH]  Registers a new torrent for the file or folder located in PATH.
     upload help    Displays this page.
 """
+
+browse_help = """Displays every torrent in the network.
+
+Usage:
+    browse-torrents       Shows a list with every available torrent
+    browse-torrents help  Displays this page."""

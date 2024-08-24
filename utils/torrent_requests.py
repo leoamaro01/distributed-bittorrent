@@ -436,7 +436,51 @@ class ServersResponse(TorrentRequest):
         for server in self.server_ips:
             servers += ip_to_bytes(server)
 
-        return RT_SERVERS_RESPONSE.to_bytes() + len(self.server_ips).to_bytes(4) + servers
+        return (
+            RT_SERVERS_RESPONSE.to_bytes() + len(self.server_ips).to_bytes(4) + servers
+        )
+
+
+class GetAllTorrentsRequest(TorrentRequest):
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["GetAllTorrentsRequest", int] | None:
+        return GetAllTorrentsRequest(), RT_GET_ALL_TORRENTS
+
+    def to_bytes(self) -> bytes:
+        return RT_GET_ALL_TORRENTS.to_bytes()
+
+
+class AllTorrentsResponse(TorrentRequest):
+    def __init__(self, torrent_ids_names: list[tuple[str, str]]) -> None:
+        self.torrent_ids_names = torrent_ids_names
+
+    @staticmethod
+    def recv_request(sock: socket.socket) -> tuple["AllTorrentsResponse", int]:
+        count = int.from_bytes(recv_all(sock, 4))
+
+        torrent_ids_names: list[tuple[str, str]] = []
+
+        for _ in range(count):
+            id_len = int.from_bytes(recv_all(sock, 4))
+            id = recv_all(sock, id_len).decode()
+
+            name_len = int.from_bytes(recv_all(sock, 4))
+            name = recv_all(sock, name_len).decode()
+
+            torrent_ids_names.append((id, name))
+
+        return AllTorrentsResponse(torrent_ids_names), RT_ALL_TORRENTS_RESPONSE
+
+    def to_bytes(self) -> bytes:
+        data = len(self.torrent_ids_names).to_bytes(4)
+
+        for id_name in self.torrent_ids_names:
+            data += len(id_name[0]).to_bytes(4)
+            data += id_name[0].encode()
+            data += len(id_name[1]).to_bytes(4)
+            data += id_name[1].encode()
+
+        return RT_ALL_TORRENTS_RESPONSE.to_bytes() + data
 
 
 # region Request IDs
@@ -458,6 +502,8 @@ RT_REGISTER_AS_PEER = 14
 RT_PIECE_DATA = 15
 RT_GET_SERVERS = 16
 RT_SERVERS_RESPONSE = 17
+RT_GET_ALL_TORRENTS = 18
+RT_ALL_TORRENTS_RESPONSE = 19
 
 requests = {
     RT_PING: PingRequest.recv_request,
@@ -478,5 +524,7 @@ requests = {
     RT_PIECE_DATA: PieceDataResponse.recv_request,
     RT_GET_SERVERS: GetServersRequest.recv_request,
     RT_SERVERS_RESPONSE: ServersResponse.recv_request,
+    RT_GET_ALL_TORRENTS: GetAllTorrentsRequest.recv_request,
+    RT_ALL_TORRENTS_RESPONSE: AllTorrentsResponse.recv_request,
 }
 # endregion

@@ -1,5 +1,6 @@
 from calendar import c
 from concurrent.futures import thread
+from email.utils import getaddresses
 from os import remove
 import socket
 import threading
@@ -26,6 +27,7 @@ GET_SUCCESSOR_LIST = 11
 DELETE_FROM_REPLICA = 12
 GET_START = 13
 GET_PREDECESSOR_LIST = 14
+GET_ALL_DATA = 15
 
 
 def get_sha_repr(data: str):
@@ -155,6 +157,19 @@ class ChordNodeReference:
     def ping(self) -> bool:
         return self._send_data(PING, expect_response=False) == b""
 
+    def get_all_data(self, data_type: bytes, checked: list[int]) -> bytes | None:
+        data_type_length = len(data_type).to_bytes(1)
+        checked_length = len(checked).to_bytes(4)
+        checked_bytes = b""
+        for id in checked:
+            checked_bytes += id.to_bytes(32)
+
+        return self._send_data(
+            GET_ALL_DATA,
+            data_type_length + data_type + checked_length + checked_bytes,
+            True,
+        )
+
     # Method to find the closest preceding finger of a given id
     def closest_preceding_finger(self, id: int) -> "ChordNodeReference":
         return node_from_bytes(
@@ -234,6 +249,7 @@ class ChordNode:
         update_succs_func: Callable[
             [list["ChordNodeReference"], list["ChordNodeReference"]], None
         ] = None,
+        get_all_data_func: Callable[[bytes], bytes] = None,
         log: Callable[[str, str], None] = None,
     ):
 
@@ -256,7 +272,6 @@ class ChordNode:
         self.m = m  # Number of bits in the hash/key space
         self.finger = [self.ref] * self.m  # Finger table
         self.fingers_lock: threading.Lock = threading.Lock()
-        self.next = 0  # Finger table index to fix next
         self.store_data_func = store_data_func  # Function to store data
         self.store_replica_func = store_replica_func  # Function to store data replicas
         self.retrieve_data_func = retrieve_data_func  # Function to retrieve data
@@ -266,6 +281,9 @@ class ChordNode:
             delete_replica_func  # Function to delete data replicas
         )
         self.update_succs_func = update_succs_func  # Function to update successors
+        self.get_all_data_func = (
+            get_all_data_func  # Function to get every item in a data category
+        )
         self.log = log  # Function to log messages
         self.start_id = self.id  # Index of the lowest key in the node's data
         self.pred_start = None
@@ -285,11 +303,21 @@ class ChordNode:
         ).start()  # Start server thread
 
     # Method to find the successor of a given id
-    def find_succ(self, id: int) -> "ChordNodeReference":
+    def find_succ(self, id: int, log=True) -> "ChordNodeReference":
+        if log:
+            self.log(f"Finding predecessor of {id}", "CHORD FIND SUCC")
         node = self.find_pred(id)  # Find predecessor of id
+        if log:
+            self.log(f"Found {node.id}", "CHORD FIND SUCC")
         successor = node.succ  # Return successor of that node
         if successor == None:
-            return self.find_succ(id)  # Retry, `node` just died
+            if log:
+                self.log(
+                    f"Invalid successor on found node. Retrying.", "CHORD FIND SUCC"
+                )
+            return self.find_succ(id, log)  # Retry, `node` just died
+        if log:
+            self.log(f"Successor found {successor.id}.", "CHORD FIND SUCC")
         return successor
 
     # Method to find the predecessor of a given id
@@ -302,6 +330,7 @@ class ChordNode:
         while True:
             # this makes sure node doesn't die between the last iteration and this one
             succ = node.succ
+
             if succ == None:
                 node = last_node.closest_preceding_finger(id)
 
@@ -325,23 +354,39 @@ class ChordNode:
                 node = closest
         return node
 
-    # Method to find the closest preceding finger of a given id
-    def closest_preceding_finger(self, id: int) -> "ChordNodeReference":
+    # Retuurns a list of fingers and items from the successor list ordered according to their distance from the current node
+    def get_fingers_ordered(self, descending=False):
         with self.fingers_lock:
-            for i in range(self.m - 1, -1, -1):
-                if (
-                    self.finger[i]
-                    and inbetween(self.finger[i].id, self.id, id)
-                    and self.finger[i].ping()
-                ):
-                    return self.finger[i]
+            fingers = self.finger.copy()
+
+        result: dict[int, ChordNodeReference] = {}
+
+        for f in fingers:
+            if f and f.id not in result:
+                result[f.id] = f
 
         with self.successor_list_lock:
-            succ_list = self.successor_list.copy()
+            succs = self.successor_list.copy()
 
-        for s in succ_list:
-            if inbetween(s.id, self.id, id):
-                return s
+        for s in succs:
+            if s and s.id not in result:
+                result[s.id] = s
+
+        def get_distance_to_id(node: ChordNodeReference):
+            distance = node.id - self.id
+            if distance < 0:
+                return 2**self.m + distance
+            return distance
+
+        return sorted(result.values(), key=get_distance_to_id, reverse=descending)
+
+    # Method to find the closest preceding finger of a given id
+    def closest_preceding_finger(self, id: int) -> "ChordNodeReference":
+        fingers = self.get_fingers_ordered(descending=True)
+
+        for f in fingers:
+            if inbetween(f.id, self.id, id) and f.ping():
+                return f
 
         return self.ref
 
@@ -372,7 +417,7 @@ class ChordNode:
     # Method to fix the successor of the current node
     def fix_succ(self):
         with self.succ_lock:
-            succ_pinged = self.succ.id != self.id and self.succ.ping()
+            succ_pinged = self.succ.id == self.id or self.succ.ping()
 
         if not succ_pinged:
             fixed = False
@@ -482,14 +527,15 @@ class ChordNode:
 
     # Fix fingers method to periodically update the finger table
     def fix_fingers(self):
+        next = self.m
         while True:
-            self.next += 1
-            if self.next >= self.m:
-                self.next = 0
+            next -= 1
+            if next < 0:
+                next = self.m - 1
 
-            succ = self.find_succ((self.id + 2**self.next) % 2**self.m)
+            succ = self.find_succ((self.id + 2**next) % 2**self.m, log=False)
             with self.fingers_lock:
-                self.finger[self.next] = succ
+                self.finger[next] = succ
             time.sleep(1)
 
     # Check predecessor method to periodically verify if the predecessor is alive
@@ -509,6 +555,7 @@ class ChordNode:
                     for pred in pred_list:
                         if pred.ping():
                             self.notify(pred)
+                            break
                         else:
                             with self.predecessor_list_lock:
                                 self.predecessor_list.remove(pred)
@@ -558,6 +605,28 @@ class ChordNode:
         key_hash = get_sha_for_bytes(key)
         node = self.find_succ(key_hash)
         return node.retrieve_key(key, key_options)
+
+    def get_all_data(self, data_type: bytes, checked: list[int] | None = None) -> bytes:
+        self.log("Getting data from func", "CHORD GET ALL")
+        my_data = self.get_all_data_func(data_type)
+
+        self.log(f"Got all data: {my_data}", "CHORD GET ALL")
+
+        checked = [self.id] if checked == None else checked + [self.id]
+
+        if self.succ.id in checked:
+            return my_data
+
+        succ_data = self.succ.get_all_data(data_type, checked)
+
+        if succ_data == None:
+            return my_data
+
+        total_count = (
+            int.from_bytes(my_data[0:4]) + int.from_bytes(succ_data[0:4])
+        ).to_bytes(4)
+
+        return total_count + my_data[4:] + succ_data[4:]
 
     def handle_connection(self, conn: socket.socket):
         option = int.from_bytes(recv_all(conn, 1))
@@ -630,6 +699,25 @@ class ChordNode:
             data_resp = len(preds).to_bytes(4)
             for s in preds:
                 data_resp += node_to_bytes(s)
+        elif option == GET_ALL_DATA:
+            bytes_read = 0
+
+            def get_data(b: int) -> bytes:
+                nonlocal bytes_read
+                d = data[bytes_read : bytes_read + b]
+                bytes_read += b
+                return d
+
+            data_type_len = int.from_bytes(get_data(1))
+            data_type = get_data(data_type_len)
+
+            checked = []
+
+            checked_len = int.from_bytes(get_data(4))
+            for _ in range(checked_len):
+                checked.append(int.from_bytes(get_data(32)))
+
+            data_resp = self.get_all_data(data_type, checked)
 
         if data_resp != None:
             if isinstance(data_resp, ChordNodeReference):

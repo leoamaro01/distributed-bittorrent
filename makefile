@@ -112,7 +112,7 @@ prerun:
 redeploy-holder-client:
 	make build-client
 	(docker stop bittorrent-client-holder && docker rm bittorrent-client-holder) || echo "Holder container not found."
-	docker run --mount source=data-volume,target=/app/data --name bittorrent-client-holder --network bittorrent-network -p 7010:7010 -p 7011:7011 -id bittorrent-client
+	docker run --mount source=data-volume,target=/app/data --name bittorrent-client-holder --network bittorrent-network -p 7010:7010 -p 7011:7011 -i bittorrent-client
 
 full-redeploy: redeploy-tracker redeploy-client
 

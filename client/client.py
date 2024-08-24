@@ -3,9 +3,8 @@ import socket
 import os
 import math
 import os.path as path
-from ssl import SOCK_STREAM
 from threading import Event, Lock, Thread
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 from utils.torrent_requests import *
 import hashlib
@@ -226,7 +225,7 @@ DOWNLOAD_LOG_TIMESTEP = 0.5
 
 MIN_KNOWN_SERVERS = 20
 
-DISCOVERY_TIMEOUT = 5
+DISCOVERY_TIMEOUT = 2
 
 DOWNLOAD_CHUNKS = 10
 
@@ -301,6 +300,7 @@ def upload_torrent(torrent_path: str) -> bool:
 
     # [(file_name, file_size, [piece_hashes])]
     files: list[TorrentFileInfo] = []
+
     dirs: list[str] = []
 
     print("Uploading torrent...")
@@ -401,12 +401,14 @@ def upload_torrent(torrent_path: str) -> bool:
     )
     print("Uploading torrent info...")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if not connect_socket_to_server(sock):
-            log("Failed to connect to the server", "UPLOAD TORRENT")
-            print("Failed to connect to the server. Check your network connection.")
-            return False
+    sock = connect_to_server()
 
+    if sock == None:
+        log("Failed to connect to the server", "UPLOAD TORRENT")
+        print("Failed to connect to the server. Check your network connection.")
+        return False
+
+    with sock:
         sock.settimeout(PIECE_TRANSFER_TIMEOUT)
 
         try:
@@ -635,11 +637,11 @@ def download_torrent(torrent_id: str):
     add_path_to_seeds(torrent_id, partial_torrent_path)
     add_path_to_seeds(torrent_id, downloaded_torrent_path)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if not connect_socket_to_server(
-            sock, True
-        ):  # this only returns false if the exit event was set
-            return
+    sock = connect_to_server(True)
+    if sock == None:
+        return
+
+    with sock:
         try:
             sock.sendall(RegisterAsPeerRequest(torrent_id).to_bytes())
         except BaseException as e:
@@ -695,9 +697,6 @@ def download_torrent(torrent_id: str):
             time.sleep(5)
             continue
 
-        if my_ip in peers:
-            peers.remove(my_ip)
-
         for p in peers:
             with known_servers_lock:
                 if len(known_servers) >= MIN_KNOWN_SERVERS:
@@ -708,59 +707,66 @@ def download_torrent(torrent_id: str):
 
         if len(pending_download_pieces) > DOWNLOAD_CHUNKS:
             downloads = pending_download_pieces[:DOWNLOAD_CHUNKS]
+        else:
+            downloads = pending_download_pieces.copy()
 
         with download_statuses_lock:
             download_statuses[torrent_id].set_status("Downloading...")
 
         exited = False
 
-        with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(download_file_piece, info, file, piece, peers)
-                for file, piece in downloads
-            ]
+        if len(downloads) > 0:
+            with ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(download_file_piece, info, file, piece, peers)
+                    for file, piece in downloads
+                ]
 
-            for future in as_completed(futures):
-                if not exited:
-                    with download_statuses_lock:
-                        cancelled = download_statuses[torrent_id].cancel_event.is_set()
-                    if cancelled or exit_event.is_set():
-                        exited = True
-                        executor.shutdown(wait=False, cancel_futures=True)
+                for future in as_completed(futures):
+                    if not exited:
+                        with download_statuses_lock:
+                            cancelled = download_statuses[
+                                torrent_id
+                            ].cancel_event.is_set()
+                        if cancelled or exit_event.is_set():
+                            exited = True
+                            executor.shutdown(wait=False, cancel_futures=True)
 
-                if future.cancelled():
-                    continue
+                    if future.cancelled():
+                        continue
 
-                try:
-                    result = future.result()
-                except BaseException as e:
-                    log(
-                        f"Error downloading a piece. Error: {e}",
-                        f"DOWNLOAD {torrent_id}",
-                    )
-                    with download_statuses_lock:
-                        download_statuses[torrent_id].set_error(
-                            f"Error downloading a piece. Error: {e}"
+                    try:
+                        result = future.result()
+                    except BaseException as e:
+                        log(
+                            f"Error downloading a piece. Error: {e}",
+                            f"DOWNLOAD {torrent_id}",
                         )
-                        download_statuses[torrent_id].cancel_event.set()
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    exited = True
-                    continue
+                        with download_statuses_lock:
+                            download_statuses[torrent_id].set_error(
+                                f"Error downloading a piece. Error: {e}"
+                            )
+                            download_statuses[torrent_id].cancel_event.set()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        exited = True
+                        continue
 
-                if result == None:
-                    continue
+                    if result == None:
+                        continue
 
-                file, piece = result
+                    file, piece = result
 
-                pending_download_pieces.remove((file, piece))
-                pending_download_files[file].remove(piece)
+                    pending_download_pieces.remove((file, piece))
+                    pending_download_files[file].remove(piece)
 
-                if file in downloaded:
-                    downloaded[file].append(piece)
-                else:
-                    downloaded[file] = [piece]
+                    if len(pending_download_files[file]) == 0:
+                        pending_download_files.pop(file)
 
-        if len(pending_download_files) == 0:
+                    if file in downloaded:
+                        downloaded[file].append(piece)
+                    else:
+                        downloaded[file] = [piece]
+        else:
             with download_statuses_lock:
                 download_statuses[torrent_id].set_status(
                     "Download finished. Reconstructing files..."
@@ -778,9 +784,6 @@ def download_torrent(torrent_id: str):
                 if exited:
                     any_failed = True
                     break
-
-                pending_download_files.pop(file)
-
                 log(
                     f"Reconstructing {file}...",
                     category=f"DOWNLOAD {torrent_id}",
@@ -1105,11 +1108,9 @@ def learn_servers_from_peer(peer: str):
             pass
 
 
-def connect_socket_to_server(
-    socket: socket.socket, block_on_disconnect: bool = False
-) -> bool:
+def connect_to_server(block_on_disconnect: bool = False) -> socket.socket | None:
     if exit_event.is_set():
-        return False
+        return None
 
     if not connected_to_server.is_set():
         if block_on_disconnect:
@@ -1117,39 +1118,43 @@ def connect_socket_to_server(
                 if connected_to_server.wait(5):
                     break
             if exit_event.is_set():
-                return False
+                return None
         else:
-            return False
+            return None
 
     with known_servers_lock:
         servers = known_servers.copy()
 
-    socket.settimeout(1)
-
     for server in servers:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+
         try:
-            socket.connect((server, SERVER_PORT))
+            sock.connect((server, SERVER_PORT))
         except:
             with known_servers_lock:
                 if server in known_servers:
                     known_servers.remove(server)
             continue
         else:
-            return True
+            sock.settimeout(socket.getdefaulttimeout())
+            return sock
 
     if not connected_to_server.is_set():
         if block_on_disconnect:
             while not exit_event.is_set():
                 if connected_to_server.wait(5):
                     break
-            return connect_socket_to_server(socket, True)
+            return connect_to_server(True)
         else:
-            return False
+            return None
 
     if not block_on_disconnect:
-        return False
+        return None
 
     connected_to_server.clear()
+
+    sock = None
 
     while not exit_event.is_set():
         servers = discover_servers()
@@ -1160,8 +1165,10 @@ def connect_socket_to_server(
             connected = False
             for server in servers_cp:
                 try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
                     log(f"Trying to connect to server {server}...", "SERVER CONNECTION")
-                    socket.connect((server, SERVER_PORT))
+                    sock.connect((server, SERVER_PORT))
                     log("Connected to server", "SERVER CONNECTION")
                     with known_servers_lock:
                         known_servers.extend(servers)
@@ -1185,11 +1192,13 @@ def connect_socket_to_server(
         continue
 
     if exit_event.is_set():
-        return False
+        return None
 
     connected_to_server.set()
 
-    return True
+    sock.settimeout(socket.getdefaulttimeout())
+
+    return sock
 
 
 def update_seeds_validity():
@@ -1285,10 +1294,12 @@ def get_torrent_info(torrent_id: str, block_on_disconnect: bool = False) -> Torr
         if torrent_id in torrent_infos:
             return torrent_infos[torrent_id]
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if not connect_socket_to_server(sock, block_on_disconnect):
-            return TorrentInfo.invalid(torrent_id)
+    sock = connect_to_server(block_on_disconnect)
 
+    if sock == None:
+        return TorrentInfo.invalid(torrent_id)
+
+    with sock:
         try:
             sock.sendall(GetTorrentRequest(torrent_id).to_bytes())
         except:
@@ -1336,42 +1347,44 @@ def get_torrent_info(torrent_id: str, block_on_disconnect: bool = False) -> Torr
 
 
 def get_torrent_peers(torrent_id: str, block_on_disconnect: bool = False) -> list[str]:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = connect_to_server(block_on_disconnect)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if not connect_socket_to_server(sock, block_on_disconnect):
-            return []
+    if sock == None:
+        log("Failed to connect to server", "GET PEERS")
+        return []
 
+    with sock:
         try:
             sock.sendall(GetPeersRequest(torrent_id).to_bytes())
-        except:
+        except BaseException as e:
+            log(
+                f"Failed to send request to the server after a successful connection. Error {e}",
+                "GET PEERS",
+            )
             if block_on_disconnect:
-                log(
-                    "Failed to send request to the server after a successful connection. Retrying...",
-                    "GET PEERS",
-                )
                 return get_torrent_peers(torrent_id, True)
             else:
                 return []
 
         try:
             req, req_type = TorrentRequest.recv_request(sock)
-        except:
+        except BaseException as e:
+            log(
+                f"Failed to get peers after a successful connection to the server. Error {e}",
+                "GET PEERS",
+            )
             if block_on_disconnect:
-                log(
-                    "Failed to get peers after a successful connection to the server. Retrying...",
-                    "GET PEERS",
-                )
                 return get_torrent_peers(torrent_id, True)
             else:
                 return []
 
     if req_type != RT_GET_PEERS_RESPONSE:
+        log(
+            f"Unexpected Response from tracker, expected {RT_GET_PEERS_RESPONSE}, received {req_type}.",
+            "GET PEERS",
+        )
         if block_on_disconnect:
-            log(
-                f"Unexpected Response from tracker, expected {RT_GET_PEERS_RESPONSE}, received {req_type}. Retrying...",
-                "GET PEERS",
-            )
+
             return get_torrent_peers(torrent_id, True)
         else:
             return []
@@ -1425,8 +1438,11 @@ def close_file_with_lock(file_path):
 
 
 def load_config():
-    available_seeds = load_config_file("available_seeds.bin")
-    torrent_infos = load_config_file("torrent_infos_cache.bin")
+    global available_seeds, torrent_infos
+    config = load_config_file("available_seeds.bin")
+    available_seeds = {} if config == None else config
+    config = load_config_file("torrent_infos_cache.bin")
+    torrent_infos = {} if config == None else config
 
 
 # endregion
@@ -1668,22 +1684,15 @@ def server_communication_thread():
 def handle_server_request(sock: socket.socket):
     global last_checkup
 
-    log("Handling server request...", "SERVER CONNECTION")
-
     with sock:
         sock.settimeout(None)
 
         try:
             req, req_type = TorrentRequest.recv_request(sock)
         except BaseException as e:
-            log(f"Failed to get request from server. Error: {e}", "SERVER CONNECTION")
             return
 
         if req_type == RT_GET_CLIENT_TORRENTS:
-            log(
-                "Server is requesting torrents currently being seeded",
-                "SERVER CONNECTION",
-            )
 
             with last_checkup_lock:
                 last_checkup = time.time()
@@ -1696,10 +1705,6 @@ def handle_server_request(sock: socket.socket):
             try:
                 sock.sendall(ClientTorrentsResponse(torrents).to_bytes())
             except BaseException as e:
-                log(
-                    f"Failed to send response to server. Error: {e}",
-                    "SERVER CONNECTION",
-                )
                 return
 
 
@@ -1732,6 +1737,9 @@ def download_command(args: list[str]):
     )
     download_thread.start()
 
+    # wait for download to register
+    time.sleep(0.5)
+
     if "--join" not in args:
         print("Download started, use join-download to view the download progress.")
     else:
@@ -1759,8 +1767,10 @@ def exit_command(args: list[str]):
 
     print("Logging out of server...")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        if connect_socket_to_server(sock):
+    sock = connect_to_server()
+
+    if sock != None:
+        with sock:
             try:
                 sock.sendall(LogoutRequest().to_bytes())
             except:
@@ -1979,13 +1989,15 @@ def seed_command(args: list[str]):
 
     add_path_to_seeds(args[1], path.dirname(args[0]))
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        log("Connecting to server...", "SEED")
-        if not connect_socket_to_server(sock):
-            log("Failed to connect to server", "SEED")
-            print("Failed to connect to server")
-            return
+    log("Connecting to server...", "SEED")
 
+    sock = connect_to_server()
+    if sock == None:
+        log("Failed to connect to server", "SEED")
+        print("Failed to connect to server")
+        return
+
+    with sock:
         try:
             sock.sendall(RegisterAsPeerRequest(args[1]).to_bytes())
         except BaseException as e:
@@ -1994,6 +2006,47 @@ def seed_command(args: list[str]):
             return
 
     print("Seeding!")
+
+
+def browse_command(args: list[str]):
+    if len(args) > 0 and args[0] == "help":
+        print(texts.browse_help)
+        return
+
+    sock = connect_to_server()
+
+    if sock == None:
+        print("Failed to connect to server. Check your connection and try again.")
+        return
+
+    with sock:
+        try:
+            sock.sendall(GetAllTorrentsRequest().to_bytes())
+        except:
+            print(
+                "Failed to send request to server. Check your connection and try again."
+            )
+            return
+
+        try:
+            req, req_type = TorrentRequest.recv_request(sock)
+        except:
+            print("Failed to receive data from server. Try again later.")
+            return
+
+        if req_type != RT_ALL_TORRENTS_RESPONSE:
+            raise TorrentError(
+                f"Wrong response received from server. Expected AllTorrentsResponse{RT_ALL_TORRENTS_RESPONSE}, received {req_type}"
+            )
+
+    req: AllTorrentsResponse
+
+    print("Torrents:")
+
+    for id_name in req.torrent_ids_names:
+        print(f"{id_name[0]} : {id_name[1]}")
+
+    print("")
 
 
 commands: dict[str, Callable] = {
@@ -2005,6 +2058,7 @@ commands: dict[str, Callable] = {
     "join-download": join_download_command,
     "cancel-download": cancel_download_command,
     "seed": seed_command,
+    "browse-torrents": browse_command,
 }
 
 # endregion
@@ -2017,12 +2071,16 @@ def attempt_reconnection_thread():
     while not exit_event.is_set():
         time.sleep(5)
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            if not connect_socket_to_server(sock):
-                log("Lost connection to server, reconnecting...", "RECONNECTION THREAD")
-                if not connect_socket_to_server(sock, True):
-                    continue
+        sock = connect_to_server()
+        if sock == None:
+            log("Lost connection to server, reconnecting...", "RECONNECTION THREAD")
 
+            sock = connect_to_server(True)
+
+            if sock == None:
+                continue
+
+        with sock:
             with last_checkup_lock:
                 not_passed = last_checkup == None or time.time() - last_checkup < 2 * 60
             if not_passed:
@@ -2124,6 +2182,8 @@ def main():
     print("Welcome to CDL-BitTorrent Client!")
     print("Starting Up...")
 
+    socket.setdefaulttimeout(5)
+
     log("Starting up. Loading configuration...", "MAIN")
 
     connected_to_server.set()
@@ -2133,7 +2193,21 @@ def main():
     print("Finding servers...")
     log("Finding servers...", "DISCOVERY")
 
-    if "--nodiscovery" not in argv:
+    direct = False
+
+    if "--direct" in argv:
+        server_index = argv.index("--direct") + 1
+        if len(argv) <= server_index:
+            print(
+                "If you are using the --direct option you must also specify a server address."
+            )
+        else:
+            with known_servers_lock:
+                known_servers.append(argv[server_index])
+
+            direct = True
+
+    if "--nodiscovery" not in argv and not direct:
         servers = discover_servers()
 
         with known_servers_lock:
@@ -2158,15 +2232,16 @@ def main():
     print("Logging in to server...")
     log("Logging in to server...", "MAIN")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as login_socket:
-        if not connect_socket_to_server(login_socket):
-            print(
-                f"Failed to connect to server, the server may be unavailable or your internet connection may be down. Exiting..."
-            )
-            log("Failed to connect to server. Exiting...", "MAIN")
-            exit_event.set()
-            exit(1)
+    login_socket = connect_to_server()
+    if login_socket == None:
+        print(
+            f"Failed to connect to server, the server may be unavailable or your internet connection may be down. Exiting..."
+        )
+        log("Failed to connect to server. Exiting...", "MAIN")
+        exit_event.set()
+        exit(1)
 
+    with login_socket:
         try:
             login_socket.sendall(LoginRequest().to_bytes())
         except:
@@ -2174,8 +2249,6 @@ def main():
             log("Failed to send login request to server. Exiting...", "MAIN")
             exit_event.set()
             exit(1)
-
-    socket.setdefaulttimeout(5)
 
     print("Done!\n")
 
