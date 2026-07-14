@@ -2,7 +2,7 @@
 
 A BitTorrent-style peer-to-peer file-sharing system built on a **Chord distributed hash table**, with fault-tolerant trackers, automatic data replication, and piece-level integrity verification. Both the client and the tracker are Dockerized Python applications with interactive CLIs.
 
-> 📄 A more detailed technical write-up (in Spanish) is available in [`specification.md`](specification.md).
+> 📄 A more detailed technical write-up is available in [`specification.md`](specification.md).
 
 ## Architecture
 
